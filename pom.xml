@@ -6,7 +6,7 @@
 
     <groupId>com.yaesu</groupId>
     <artifactId>net-audio</artifactId>
-    <version>1.2.0</version>
+    <version>1.2.1</version>
     <packaging>jar</packaging>
 
     <name>Net-Audio Streaming Library</name>
