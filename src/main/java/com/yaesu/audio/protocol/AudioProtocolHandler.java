@@ -26,8 +26,12 @@ public class AudioProtocolHandler implements Closeable {
     /** Heartbeat interval in milliseconds */
     public static final int HEARTBEAT_INTERVAL_MS = 5000;
 
-    /** Connection timeout for no response in milliseconds */
-    public static final int CONNECTION_TIMEOUT_MS = 30000;
+    /** Connection timeout for no response in milliseconds.
+     *  Reduced to 10s for FT8 - faster failure detection (FT8 cycle is 15s) */
+    public static final int CONNECTION_TIMEOUT_MS = 10000;
+
+    /** Maximum consecutive CRC errors before closing connection */
+    private static final int MAX_CONSECUTIVE_CRC_ERRORS = 5;
 
     private final Socket socket;
     private final DataInputStream input;
@@ -44,6 +48,7 @@ public class AudioProtocolHandler implements Closeable {
     private volatile long bytesSent = 0;
     private volatile long bytesReceived = 0;
     private volatile int crcErrors = 0;
+    private volatile int consecutiveCrcErrors = 0;
 
     /**
      * Creates a protocol handler for the given socket.
@@ -122,10 +127,15 @@ public class AudioProtocolHandler implements Closeable {
 
     /**
      * Receives a packet with the specified timeout.
+     * <p>
+     * CRC errors are handled gracefully - a single CRC error will skip the packet
+     * and return null (allowing the caller to continue). Only after multiple
+     * consecutive CRC errors will an IOException be thrown.
+     * </p>
      *
      * @param timeoutMs timeout in milliseconds (0 for blocking)
-     * @return the received packet, or null if timeout or closed
-     * @throws IOException if reading fails
+     * @return the received packet, or null if timeout, closed, or single CRC error
+     * @throws IOException if reading fails or too many consecutive CRC errors
      */
     public AudioPacket receivePacket(int timeoutMs) throws IOException {
         if (closed) {
@@ -144,13 +154,26 @@ public class AudioProtocolHandler implements Closeable {
             headerBuf.order(ByteOrder.BIG_ENDIAN);
             short magic = headerBuf.getShort();
             if (magic != AudioPacket.MAGIC) {
-                throw new IOException("Invalid packet magic: 0x" + Integer.toHexString(magic & 0xFFFF));
+                // Invalid magic - try to resync by reading byte-by-byte
+                // This can happen after packet loss on noisy networks
+                consecutiveCrcErrors++;
+                crcErrors++;
+                if (consecutiveCrcErrors >= MAX_CONSECUTIVE_CRC_ERRORS) {
+                    throw new IOException("Too many consecutive packet errors (" +
+                        consecutiveCrcErrors + "), connection may be corrupted");
+                }
+                return null; // Skip this packet, let caller retry
             }
 
             // Get payload length (at offset 17)
             int payloadLen = ((header[17] & 0xFF) << 8) | (header[18] & 0xFF);
             if (payloadLen > AudioPacket.MAX_PAYLOAD) {
-                throw new IOException("Payload too large: " + payloadLen);
+                consecutiveCrcErrors++;
+                crcErrors++;
+                if (consecutiveCrcErrors >= MAX_CONSECUTIVE_CRC_ERRORS) {
+                    throw new IOException("Too many consecutive packet errors - payload too large: " + payloadLen);
+                }
+                return null; // Skip this packet
             }
 
             // Read payload and CRC
@@ -165,9 +188,18 @@ public class AudioProtocolHandler implements Closeable {
             // Deserialize and validate
             AudioPacket packet = AudioPacket.deserialize(fullPacket);
             if (packet == null) {
+                // CRC validation failed - skip this packet but don't fail connection
+                consecutiveCrcErrors++;
                 crcErrors++;
-                throw new IOException("Packet CRC validation failed");
+                if (consecutiveCrcErrors >= MAX_CONSECUTIVE_CRC_ERRORS) {
+                    throw new IOException("Too many consecutive CRC errors (" +
+                        consecutiveCrcErrors + "), connection may be corrupted");
+                }
+                return null; // Skip this packet, let caller retry
             }
+
+            // Success - reset consecutive error counter
+            consecutiveCrcErrors = 0;
 
             lastReceiveTime = System.currentTimeMillis();
             packetsReceived++;

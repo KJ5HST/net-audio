@@ -42,6 +42,27 @@ public class AudioStreamConfig {
     /** Maximum buffer level in milliseconds */
     public static final int DEFAULT_BUFFER_MAX_MS = 300;
 
+    /** FT8-optimized target buffer - low latency for digital modes */
+    public static final int FT8_BUFFER_TARGET_MS = 40;
+
+    /** FT8-optimized minimum buffer */
+    public static final int FT8_BUFFER_MIN_MS = 20;
+
+    /** FT8-optimized maximum buffer */
+    public static final int FT8_BUFFER_MAX_MS = 100;
+
+    /** Voice-optimized target buffer - balanced latency/stability for SSB */
+    public static final int VOICE_BUFFER_TARGET_MS = 120;
+
+    /** Voice-optimized minimum buffer */
+    public static final int VOICE_BUFFER_MIN_MS = 60;
+
+    /** Voice-optimized maximum buffer */
+    public static final int VOICE_BUFFER_MAX_MS = 300;
+
+    /** Maximum time to wait for initial buffering before starting playback (ms) */
+    public static final int MAX_INITIAL_BUFFERING_MS = 500;
+
     /** Default audio server port */
     public static final int DEFAULT_PORT = 4533;
 
@@ -229,6 +250,61 @@ public class AudioStreamConfig {
     public static AudioStreamConfig lowBandwidth() {
         return new AudioStreamConfig()
             .setSampleRate(LOW_BANDWIDTH_SAMPLE_RATE);
+    }
+
+    /**
+     * Creates a configuration optimized for FT8 and other digital modes.
+     * <p>
+     * Uses lower buffer targets (40ms vs 100ms default) to minimize latency,
+     * which is critical for FT8 timing requirements. FT8 uses 15-second
+     * cycles and 160ms symbol periods, so total system latency should be
+     * kept under 200ms for reliable operation.
+     * </p>
+     */
+    public static AudioStreamConfig ft8Optimized() {
+        return new AudioStreamConfig()
+            .setBufferTargetMs(FT8_BUFFER_TARGET_MS)
+            .setBufferMinMs(FT8_BUFFER_MIN_MS)
+            .setBufferMaxMs(FT8_BUFFER_MAX_MS);
+    }
+
+    /**
+     * Checks if this configuration uses FT8-optimized buffer settings.
+     */
+    public boolean isFt8Optimized() {
+        return bufferTargetMs <= FT8_BUFFER_TARGET_MS;
+    }
+
+    /**
+     * Creates a configuration optimized for SSB voice operation.
+     * <p>
+     * Uses moderate buffer targets (120ms) to provide good stability on
+     * WiFi and Internet connections while maintaining acceptable latency
+     * for voice conversation. Voice can tolerate up to 300-400ms latency
+     * before conversation becomes awkward.
+     * </p>
+     * <p>
+     * Use this profile for:
+     * <ul>
+     *   <li>SSB voice operation</li>
+     *   <li>AM/FM voice modes</li>
+     *   <li>Operation over WiFi or Internet</li>
+     *   <li>When experiencing buffer underruns with FT8 settings</li>
+     * </ul>
+     * </p>
+     */
+    public static AudioStreamConfig voiceOptimized() {
+        return new AudioStreamConfig()
+            .setBufferTargetMs(VOICE_BUFFER_TARGET_MS)
+            .setBufferMinMs(VOICE_BUFFER_MIN_MS)
+            .setBufferMaxMs(VOICE_BUFFER_MAX_MS);
+    }
+
+    /**
+     * Checks if this configuration uses voice-optimized buffer settings.
+     */
+    public boolean isVoiceOptimized() {
+        return bufferTargetMs >= VOICE_BUFFER_TARGET_MS;
     }
 
     @Override

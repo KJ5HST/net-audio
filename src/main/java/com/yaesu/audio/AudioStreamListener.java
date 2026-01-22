@@ -72,4 +72,20 @@ public interface AudioStreamListener {
      * Called when the audio server stops.
      */
     default void onServerStopped() {}
+
+    /**
+     * Called when the client is attempting to reconnect after connection loss.
+     *
+     * @param clientId identifier for the client connection
+     * @param attempt the current reconnection attempt number (1-based)
+     * @param maxAttempts the maximum number of attempts that will be made
+     */
+    default void onReconnecting(String clientId, int attempt, int maxAttempts) {}
+
+    /**
+     * Called when the client successfully reconnects after connection loss.
+     *
+     * @param clientId identifier for the client connection
+     */
+    default void onReconnected(String clientId) {}
 }

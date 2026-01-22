@@ -9,8 +9,11 @@ package com.yaesu.audio.client;
 
 import com.yaesu.audio.AudioDeviceInfo;
 import com.yaesu.audio.AudioDeviceManager;
+import com.yaesu.audio.AudioStreamConfig;
 
+import javax.sound.sampled.*;
 import java.util.List;
+import java.util.logging.Logger;
 
 /**
  * Helper for integrating with platform-specific virtual audio devices.
@@ -26,6 +29,11 @@ import java.util.List;
  */
 public class VirtualAudioBridge {
 
+    private static final Logger logger = Logger.getLogger(VirtualAudioBridge.class.getName());
+
+    /** Required sample rate for WSJT-X compatibility */
+    private static final int REQUIRED_SAMPLE_RATE = AudioStreamConfig.DEFAULT_SAMPLE_RATE;
+
     /**
      * Supported platforms.
      */
@@ -38,12 +46,21 @@ public class VirtualAudioBridge {
 
     private final AudioDeviceManager deviceManager;
     private final Platform platform;
+    private final AudioStreamConfig config;
 
     /**
      * Creates a new virtual audio bridge.
      */
     public VirtualAudioBridge(AudioDeviceManager deviceManager) {
+        this(deviceManager, new AudioStreamConfig());
+    }
+
+    /**
+     * Creates a new virtual audio bridge with custom configuration.
+     */
+    public VirtualAudioBridge(AudioDeviceManager deviceManager, AudioStreamConfig config) {
         this.deviceManager = deviceManager;
+        this.config = config;
         this.platform = detectPlatform();
     }
 
@@ -91,6 +108,7 @@ public class VirtualAudioBridge {
 
     /**
      * Attempts to find the best virtual device for capture.
+     * Validates that the device supports the required sample rate (48kHz).
      */
     public AudioDeviceInfo findBestCaptureDevice() {
         List<AudioDeviceInfo> devices = findVirtualCaptureDevices();
@@ -98,22 +116,37 @@ public class VirtualAudioBridge {
             return null;
         }
 
-        // Platform-specific preferences
+        // Platform-specific preferences, with sample rate validation
         String[] preferredPatterns = getPreferredPatterns();
         for (String pattern : preferredPatterns) {
             for (AudioDeviceInfo device : devices) {
                 if (device.getName().toLowerCase().contains(pattern)) {
-                    return device;
+                    if (supportsSampleRate(device, true)) {
+                        return device;
+                    } else {
+                        logger.warning("Virtual audio device '" + device.getName() +
+                            "' does not support required sample rate (" + config.getSampleRate() + " Hz)");
+                    }
                 }
             }
         }
 
-        // Return first virtual device found
+        // Fall back to first device that supports required sample rate
+        for (AudioDeviceInfo device : devices) {
+            if (supportsSampleRate(device, true)) {
+                return device;
+            }
+        }
+
+        // Last resort: return first device even without validation
+        logger.warning("No virtual capture device found with verified " +
+            config.getSampleRate() + " Hz support. Using first available device.");
         return devices.get(0);
     }
 
     /**
      * Attempts to find the best virtual device for playback.
+     * Validates that the device supports the required sample rate (48kHz).
      */
     public AudioDeviceInfo findBestPlaybackDevice() {
         List<AudioDeviceInfo> devices = findVirtualPlaybackDevices();
@@ -121,18 +154,101 @@ public class VirtualAudioBridge {
             return null;
         }
 
-        // Platform-specific preferences
+        // Platform-specific preferences, with sample rate validation
         String[] preferredPatterns = getPreferredPatterns();
         for (String pattern : preferredPatterns) {
             for (AudioDeviceInfo device : devices) {
                 if (device.getName().toLowerCase().contains(pattern)) {
-                    return device;
+                    if (supportsSampleRate(device, false)) {
+                        return device;
+                    } else {
+                        logger.warning("Virtual audio device '" + device.getName() +
+                            "' does not support required sample rate (" + config.getSampleRate() + " Hz)");
+                    }
                 }
             }
         }
 
-        // Return first virtual device found
+        // Fall back to first device that supports required sample rate
+        for (AudioDeviceInfo device : devices) {
+            if (supportsSampleRate(device, false)) {
+                return device;
+            }
+        }
+
+        // Last resort: return first device even without validation
+        logger.warning("No virtual playback device found with verified " +
+            config.getSampleRate() + " Hz support. Using first available device.");
         return devices.get(0);
+    }
+
+    /**
+     * Checks if a device supports the required sample rate.
+     *
+     * @param device the device to check
+     * @param forCapture true for capture device, false for playback
+     * @return true if the device supports the required sample rate
+     */
+    public boolean supportsSampleRate(AudioDeviceInfo device, boolean forCapture) {
+        try {
+            Mixer mixer = AudioSystem.getMixer(device.getMixerInfo());
+            AudioFormat requiredFormat = config.toAudioFormat();
+
+            // Get the appropriate line info
+            Line.Info[] lineInfos;
+            if (forCapture) {
+                lineInfos = mixer.getTargetLineInfo();
+            } else {
+                lineInfos = mixer.getSourceLineInfo();
+            }
+
+            for (Line.Info lineInfo : lineInfos) {
+                if (lineInfo instanceof DataLine.Info) {
+                    DataLine.Info dataLineInfo = (DataLine.Info) lineInfo;
+                    if (dataLineInfo.isFormatSupported(requiredFormat)) {
+                        return true;
+                    }
+
+                    // Also check if any supported format matches our sample rate
+                    AudioFormat[] formats = dataLineInfo.getFormats();
+                    for (AudioFormat format : formats) {
+                        if (format.getSampleRate() == AudioSystem.NOT_SPECIFIED ||
+                            format.getSampleRate() == config.getSampleRate()) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.fine("Could not verify sample rate support for " + device.getName() + ": " + e.getMessage());
+        }
+
+        return false;
+    }
+
+    /**
+     * Validates that the given device supports the required audio format.
+     * Logs warnings if validation fails but does not throw exceptions.
+     *
+     * @param device the device to validate
+     * @param forCapture true for capture device, false for playback
+     * @return true if validation passed, false otherwise
+     */
+    public boolean validateDevice(AudioDeviceInfo device, boolean forCapture) {
+        if (device == null) {
+            return false;
+        }
+
+        if (!supportsSampleRate(device, forCapture)) {
+            logger.warning(String.format(
+                "Device '%s' may not support required format: %d Hz, %d-bit, %d channel(s). " +
+                "Audio quality may be affected.",
+                device.getName(), config.getSampleRate(),
+                config.getBitsPerSample(), config.getChannels()));
+            return false;
+        }
+
+        return true;
     }
 
     /**
