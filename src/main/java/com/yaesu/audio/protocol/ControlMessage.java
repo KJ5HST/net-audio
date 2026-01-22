@@ -172,15 +172,83 @@ public class ControlMessage {
      * @param protocolVersion protocol version
      */
     public static ControlMessage connectRequest(String clientName, byte protocolVersion) {
+        return connectRequest(clientName, protocolVersion, null);
+    }
+
+    /**
+     * Creates a connect request message with requested audio configuration.
+     *
+     * @param clientName optional client name
+     * @param protocolVersion protocol version
+     * @param requestedConfig optional requested audio configuration (buffer settings)
+     */
+    public static ControlMessage connectRequest(String clientName, byte protocolVersion, AudioStreamConfig requestedConfig) {
         byte[] nameBytes = clientName != null ?
             clientName.getBytes(StandardCharsets.UTF_8) : new byte[0];
-        ByteBuffer buffer = ByteBuffer.allocate(2 + nameBytes.length);
+
+        // If config provided, include buffer settings (6 bytes: target, min, max as shorts)
+        int configSize = requestedConfig != null ? 6 : 0;
+        ByteBuffer buffer = ByteBuffer.allocate(3 + nameBytes.length + configSize);
+        buffer.order(ByteOrder.BIG_ENDIAN);
+
         buffer.put(protocolVersion);
         buffer.put((byte) nameBytes.length);
         if (nameBytes.length > 0) {
             buffer.put(nameBytes);
         }
+
+        // Flag indicating if config is included
+        buffer.put((byte) (requestedConfig != null ? 1 : 0));
+
+        if (requestedConfig != null) {
+            buffer.putShort((short) requestedConfig.getBufferTargetMs());
+            buffer.putShort((short) requestedConfig.getBufferMinMs());
+            buffer.putShort((short) requestedConfig.getBufferMaxMs());
+        }
+
         return new ControlMessage(Type.CONNECT_REQUEST, buffer.array());
+    }
+
+    /**
+     * Parses requested audio configuration from a connect request message.
+     *
+     * @return the requested config, or null if none was included
+     */
+    public AudioStreamConfig parseConnectRequestConfig() {
+        if (type != Type.CONNECT_REQUEST || data.length < 3) {
+            return null;
+        }
+
+        ByteBuffer buffer = ByteBuffer.wrap(data);
+        buffer.order(ByteOrder.BIG_ENDIAN);
+
+        // Skip version
+        buffer.get();
+
+        // Skip client name
+        int nameLen = buffer.get() & 0xFF;
+        if (buffer.remaining() < nameLen + 1) {
+            return null;  // Malformed or old protocol version
+        }
+        buffer.position(buffer.position() + nameLen);
+
+        // Check if config flag is present
+        if (buffer.remaining() < 1) {
+            return null;  // Old protocol version without config
+        }
+
+        byte hasConfig = buffer.get();
+        if (hasConfig == 0 || buffer.remaining() < 6) {
+            return null;  // No config included
+        }
+
+        // Parse buffer settings
+        AudioStreamConfig config = new AudioStreamConfig();
+        config.setBufferTargetMs(buffer.getShort() & 0xFFFF);
+        config.setBufferMinMs(buffer.getShort() & 0xFFFF);
+        config.setBufferMaxMs(buffer.getShort() & 0xFFFF);
+
+        return config;
     }
 
     /**
@@ -207,19 +275,32 @@ public class ControlMessage {
 
     /**
      * Creates an audio config message.
+     * <p>
+     * Includes both audio format parameters and buffer settings so the
+     * client knows exactly what configuration the server is using.
+     * </p>
      */
     public static ControlMessage audioConfig(AudioStreamConfig config) {
-        ByteBuffer buffer = ByteBuffer.allocate(8);
+        // Extended format: 8 bytes audio format + 6 bytes buffer settings
+        ByteBuffer buffer = ByteBuffer.allocate(14);
         buffer.order(ByteOrder.BIG_ENDIAN);
         buffer.putInt(config.getSampleRate());
         buffer.put((byte) config.getBitsPerSample());
         buffer.put((byte) config.getChannels());
         buffer.putShort((short) config.getFrameDurationMs());
+        // Buffer settings
+        buffer.putShort((short) config.getBufferTargetMs());
+        buffer.putShort((short) config.getBufferMinMs());
+        buffer.putShort((short) config.getBufferMaxMs());
         return new ControlMessage(Type.AUDIO_CONFIG, buffer.array());
     }
 
     /**
      * Parses audio config from message data.
+     * <p>
+     * Handles both old format (8 bytes, no buffer settings) and new format
+     * (14 bytes, includes buffer settings) for backward compatibility.
+     * </p>
      */
     public AudioStreamConfig parseAudioConfig() {
         if (type != Type.AUDIO_CONFIG || data.length < 8) {
@@ -233,6 +314,14 @@ public class ControlMessage {
         config.setBitsPerSample(buffer.get() & 0xFF);
         config.setChannels(buffer.get() & 0xFF);
         config.setFrameDurationMs(buffer.getShort() & 0xFFFF);
+
+        // Parse buffer settings if present (new format)
+        if (data.length >= 14) {
+            config.setBufferTargetMs(buffer.getShort() & 0xFFFF);
+            config.setBufferMinMs(buffer.getShort() & 0xFFFF);
+            config.setBufferMaxMs(buffer.getShort() & 0xFFFF);
+        }
+
         return config;
     }
 

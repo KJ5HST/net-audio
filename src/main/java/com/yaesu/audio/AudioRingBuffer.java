@@ -9,6 +9,7 @@ package com.yaesu.audio;
 
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.logging.Logger;
 
 /**
  * Thread-safe ring buffer for audio streaming with jitter compensation.
@@ -20,9 +21,15 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 public class AudioRingBuffer {
 
+    private static final Logger logger = Logger.getLogger(AudioRingBuffer.class.getName());
+
+    /** Log warning after this many overruns/underruns per minute */
+    private static final int WARN_THRESHOLD_PER_MINUTE = 10;
+
     private final byte[] buffer;
     private final int capacity;
-    private final AudioStreamConfig config;
+    private AudioStreamConfig config;
+    private final String name;
 
     private int writePos = 0;
     private int readPos = 0;
@@ -38,16 +45,21 @@ public class AudioRingBuffer {
     private int underrunCount = 0;
     private int overrunCount = 0;
 
+    // Rate tracking for logging
+    private long lastOverrunLogTime = 0;
+    private long lastUnderrunLogTime = 0;
+    private int overrunsSinceLastLog = 0;
+    private int underrunsSinceLastLog = 0;
+    private boolean firstOverrun = true;
+    private boolean firstUnderrun = true;
+
     /**
      * Creates a new ring buffer with capacity based on the config's max buffer setting.
      *
      * @param config the audio stream configuration
      */
     public AudioRingBuffer(AudioStreamConfig config) {
-        this.config = config;
-        // Allocate enough for max buffer plus some headroom
-        this.capacity = config.msToBytes(config.getBufferMaxMs() * 2);
-        this.buffer = new byte[capacity];
+        this(config, config.msToBytes(config.getBufferMaxMs() * 2), "AudioRingBuffer");
     }
 
     /**
@@ -57,9 +69,40 @@ public class AudioRingBuffer {
      * @param capacityBytes the buffer capacity in bytes
      */
     public AudioRingBuffer(AudioStreamConfig config, int capacityBytes) {
+        this(config, capacityBytes, "AudioRingBuffer");
+    }
+
+    /**
+     * Creates a new ring buffer with explicit capacity and name for logging.
+     *
+     * @param config the audio stream configuration
+     * @param capacityBytes the buffer capacity in bytes
+     * @param name name for this buffer (used in log messages)
+     */
+    public AudioRingBuffer(AudioStreamConfig config, int capacityBytes, String name) {
         this.config = config;
         this.capacity = capacityBytes;
         this.buffer = new byte[capacity];
+        this.name = name;
+    }
+
+    /**
+     * Updates the buffer threshold configuration.
+     * <p>
+     * This allows adjusting buffer timing thresholds (target, min, max) after
+     * the buffer has been created, typically during connection handshake when
+     * the client requests specific buffer settings.
+     * </p>
+     *
+     * @param newConfig the new configuration with updated buffer thresholds
+     */
+    public void updateConfig(AudioStreamConfig newConfig) {
+        lock.lock();
+        try {
+            this.config = newConfig;
+        } finally {
+            lock.unlock();
+        }
     }
 
     /**
@@ -86,6 +129,7 @@ public class AudioRingBuffer {
                 readPos = (readPos + toDrop) % capacity;
                 available -= toDrop;
                 overrunCount++;
+                logOverrun(toDrop);
             }
 
             // Write data to buffer
@@ -123,43 +167,47 @@ public class AudioRingBuffer {
      * Reads data from the buffer.
      * <p>
      * Blocks until the requested number of bytes are available or timeout occurs.
+     * If data is available but less than requested, returns the available data
+     * rather than blocking (partial read).
      * </p>
      *
      * @param data the buffer to read into
      * @param offset the offset in the buffer
      * @param length the number of bytes to read
-     * @param timeoutMs the timeout in milliseconds (0 for no timeout)
-     * @return the number of bytes read, or -1 if interrupted
+     * @param timeoutMs the timeout in milliseconds (0 for non-blocking)
+     * @return the number of bytes read (may be less than requested),
+     *         0 if timeout with no data, or -1 if interrupted
      */
     public int read(byte[] data, int offset, int length, long timeoutMs) {
         lock.lock();
         try {
             long deadline = timeoutMs > 0 ? System.currentTimeMillis() + timeoutMs : Long.MAX_VALUE;
 
-            // Wait for data
-            while (available < length) {
-                if (available == 0 && timeoutMs > 0) {
-                    long remaining = deadline - System.currentTimeMillis();
-                    if (remaining <= 0) {
-                        underrunCount++;
-                        return 0; // Timeout with no data
-                    }
-                    try {
-                        notEmpty.await(remaining, java.util.concurrent.TimeUnit.MILLISECONDS);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        return -1;
-                    }
-                } else if (available > 0 && available < length) {
-                    // Have some data but not enough - return what we have
-                    break;
-                } else if (timeoutMs == 0) {
-                    // Non-blocking and no data
+            // Wait for at least some data
+            while (available == 0) {
+                if (timeoutMs == 0) {
+                    // Non-blocking mode and no data
                     return 0;
+                }
+
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0) {
+                    // Timeout with no data - this is an underrun
+                    underrunCount++;
+                    logUnderrun();
+                    return 0;
+                }
+
+                try {
+                    notEmpty.await(remaining, java.util.concurrent.TimeUnit.MILLISECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return -1;
                 }
             }
 
-            // Read available data (up to requested length)
+            // Have some data - return as much as we can (up to requested length)
+            // This is the key fix: return partial data immediately rather than waiting
             int toRead = Math.min(length, available);
             int bytesRead = 0;
 
@@ -341,5 +389,99 @@ public class AudioRingBuffer {
     public String toString() {
         return String.format("AudioRingBuffer[%d/%d bytes, %d ms, %d underruns, %d overruns]",
             getAvailable(), capacity, getBufferLevelMs(), underrunCount, overrunCount);
+    }
+
+    /**
+     * Logs overrun events with rate limiting to avoid log spam.
+     */
+    private void logOverrun(int bytesDropped) {
+        overrunsSinceLastLog++;
+        long now = System.currentTimeMillis();
+
+        // Log first overrun immediately
+        if (firstOverrun) {
+            firstOverrun = false;
+            logger.warning(String.format("[%s] Buffer overrun: dropped %d bytes (%d ms). " +
+                "This may indicate network jitter or insufficient buffer size.",
+                name, bytesDropped, config.bytesToMs(bytesDropped)));
+            lastOverrunLogTime = now;
+            overrunsSinceLastLog = 0;
+            return;
+        }
+
+        // Log rate every minute if threshold exceeded
+        if (now - lastOverrunLogTime >= 60000) {
+            if (overrunsSinceLastLog >= WARN_THRESHOLD_PER_MINUTE) {
+                logger.warning(String.format("[%s] Buffer overruns: %d in last minute. " +
+                    "Consider increasing buffer size or improving network stability.",
+                    name, overrunsSinceLastLog));
+            }
+            lastOverrunLogTime = now;
+            overrunsSinceLastLog = 0;
+        }
+    }
+
+    /**
+     * Logs underrun events with rate limiting to avoid log spam.
+     */
+    private void logUnderrun() {
+        underrunsSinceLastLog++;
+        long now = System.currentTimeMillis();
+
+        // Log first underrun immediately
+        if (firstUnderrun) {
+            firstUnderrun = false;
+            logger.warning(String.format("[%s] Buffer underrun: no data available. " +
+                "This may indicate network issues or audio source problems.",
+                name));
+            lastUnderrunLogTime = now;
+            underrunsSinceLastLog = 0;
+            return;
+        }
+
+        // Log rate every minute if threshold exceeded
+        if (now - lastUnderrunLogTime >= 60000) {
+            if (underrunsSinceLastLog >= WARN_THRESHOLD_PER_MINUTE) {
+                logger.warning(String.format("[%s] Buffer underruns: %d in last minute. " +
+                    "Consider increasing buffer size or checking audio source.",
+                    name, underrunsSinceLastLog));
+            }
+            lastUnderrunLogTime = now;
+            underrunsSinceLastLog = 0;
+        }
+    }
+
+    /**
+     * Gets the overrun rate (overruns per minute) since last reset.
+     * Returns 0 if less than a minute has elapsed.
+     */
+    public float getOverrunRate() {
+        lock.lock();
+        try {
+            long elapsed = System.currentTimeMillis() - lastOverrunLogTime;
+            if (elapsed < 60000) {
+                return 0;
+            }
+            return (overrunsSinceLastLog * 60000f) / elapsed;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Gets the underrun rate (underruns per minute) since last reset.
+     * Returns 0 if less than a minute has elapsed.
+     */
+    public float getUnderrunRate() {
+        lock.lock();
+        try {
+            long elapsed = System.currentTimeMillis() - lastUnderrunLogTime;
+            if (elapsed < 60000) {
+                return 0;
+            }
+            return (underrunsSinceLastLog * 60000f) / elapsed;
+        } finally {
+            lock.unlock();
+        }
     }
 }

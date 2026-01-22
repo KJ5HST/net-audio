@@ -28,6 +28,15 @@ public class AudioStreamClient {
     /** Connection timeout in milliseconds */
     private static final int CONNECT_TIMEOUT_MS = 10000;
 
+    /** Default initial reconnect delay in milliseconds */
+    private static final int DEFAULT_RECONNECT_DELAY_MS = 1000;
+
+    /** Default maximum reconnect delay in milliseconds */
+    private static final int DEFAULT_MAX_RECONNECT_DELAY_MS = 30000;
+
+    /** Default maximum reconnection attempts */
+    private static final int DEFAULT_MAX_RECONNECT_ATTEMPTS = 10;
+
     private final String serverHost;
     private final int serverPort;
     private final String clientName;
@@ -53,6 +62,15 @@ public class AudioStreamClient {
     private volatile boolean closed = false;
     private volatile long measuredLatencyMs = 0;
     private long connectTime;
+
+    // Auto-reconnection settings
+    private boolean autoReconnect = true;
+    private int maxReconnectAttempts = DEFAULT_MAX_RECONNECT_ATTEMPTS;
+    private int reconnectDelayMs = DEFAULT_RECONNECT_DELAY_MS;
+    private int maxReconnectDelayMs = DEFAULT_MAX_RECONNECT_DELAY_MS;
+    private volatile boolean reconnecting = false;
+    private volatile int reconnectAttempt = 0;
+    private Thread reconnectThread;
 
     // Worker threads
     private Thread captureThread;
@@ -105,6 +123,31 @@ public class AudioStreamClient {
      */
     public AudioDeviceManager getDeviceManager() {
         return deviceManager;
+    }
+
+    /**
+     * Gets the current audio stream configuration.
+     */
+    public AudioStreamConfig getConfig() {
+        return config;
+    }
+
+    /**
+     * Sets the audio stream configuration.
+     * <p>
+     * Must be called before {@link #connect()}. Use factory methods like
+     * {@link AudioStreamConfig#ft8Optimized()} or {@link AudioStreamConfig#voiceOptimized()}
+     * to get pre-configured settings for specific use cases.
+     * </p>
+     *
+     * @param config the configuration to use
+     * @throws IllegalStateException if already connected
+     */
+    public void setConfig(AudioStreamConfig config) {
+        if (connected) {
+            throw new IllegalStateException("Cannot change config while connected");
+        }
+        this.config = config;
     }
 
     /**
@@ -166,52 +209,19 @@ public class AudioStreamClient {
     }
 
     /**
-     * Closes all resources.
+     * Closes all resources and stops any reconnection attempts.
      */
     private void close() {
         if (closed) return;
         closed = true;
-        streaming = false;
-        connected = false;
+        reconnecting = false;
 
-        notifyStreamStopped("local");
-
-        // Stop threads
-        if (captureThread != null) captureThread.interrupt();
-        if (playbackThread != null) playbackThread.interrupt();
-        if (receiveThread != null) receiveThread.interrupt();
-        if (sendThread != null) sendThread.interrupt();
-        if (heartbeatThread != null) heartbeatThread.interrupt();
-
-        // Close audio lines
-        if (captureLine != null) {
-            captureLine.stop();
-            captureLine.close();
-        }
-        if (playbackLine != null) {
-            playbackLine.stop();
-            playbackLine.close();
+        // Stop reconnection thread if running
+        if (reconnectThread != null) {
+            reconnectThread.interrupt();
         }
 
-        // Close protocol handler
-        if (protocol != null) {
-            try {
-                protocol.close();
-            } catch (IOException ignored) {}
-        }
-
-        // Close socket
-        if (socket != null) {
-            try {
-                socket.close();
-            } catch (IOException ignored) {}
-        }
-
-        // Shutdown executor
-        if (executor != null) {
-            executor.shutdownNow();
-        }
-
+        closeResources();
         notifyClientDisconnected("local");
     }
 
@@ -271,6 +281,68 @@ public class AudioStreamClient {
     }
 
     /**
+     * Enables or disables automatic reconnection on connection loss.
+     * Default is enabled.
+     *
+     * @param autoReconnect true to enable auto-reconnection
+     */
+    public void setAutoReconnect(boolean autoReconnect) {
+        this.autoReconnect = autoReconnect;
+    }
+
+    /**
+     * Checks if auto-reconnection is enabled.
+     */
+    public boolean isAutoReconnect() {
+        return autoReconnect;
+    }
+
+    /**
+     * Sets the maximum number of reconnection attempts before giving up.
+     * Default is 10.
+     *
+     * @param maxAttempts maximum reconnection attempts
+     */
+    public void setMaxReconnectAttempts(int maxAttempts) {
+        this.maxReconnectAttempts = maxAttempts;
+    }
+
+    /**
+     * Sets the initial reconnection delay in milliseconds.
+     * Delay doubles with each attempt up to maxReconnectDelayMs.
+     * Default is 1000ms.
+     *
+     * @param delayMs initial delay in milliseconds
+     */
+    public void setReconnectDelayMs(int delayMs) {
+        this.reconnectDelayMs = delayMs;
+    }
+
+    /**
+     * Sets the maximum reconnection delay in milliseconds.
+     * Default is 30000ms (30 seconds).
+     *
+     * @param maxDelayMs maximum delay in milliseconds
+     */
+    public void setMaxReconnectDelayMs(int maxDelayMs) {
+        this.maxReconnectDelayMs = maxDelayMs;
+    }
+
+    /**
+     * Checks if the client is currently attempting to reconnect.
+     */
+    public boolean isReconnecting() {
+        return reconnecting;
+    }
+
+    /**
+     * Gets the current reconnection attempt number.
+     */
+    public int getReconnectAttempt() {
+        return reconnectAttempt;
+    }
+
+    /**
      * Adds a stream listener.
      */
     public void addStreamListener(AudioStreamListener listener) {
@@ -288,7 +360,7 @@ public class AudioStreamClient {
 
     private boolean performHandshake() throws IOException {
         // Send connect request
-        protocol.sendControl(ControlMessage.connectRequest(clientName, AudioPacket.VERSION));
+        protocol.sendControl(ControlMessage.connectRequest(clientName, AudioPacket.VERSION, config));
 
         // Wait for response
         AudioPacket packet = protocol.receivePacket(CONNECT_TIMEOUT_MS);
@@ -355,31 +427,38 @@ public class AudioStreamClient {
     private void startWorkerThreads() {
         // Receive thread - receives RX audio from server, puts in buffer
         receiveThread = new Thread(() -> {
-            while (!closed && connected) {
-                try {
-                    AudioPacket packet = protocol.receivePacket(100);
-                    if (packet == null) continue;
+            try {
+                while (!closed && connected) {
+                    try {
+                        AudioPacket packet = protocol.receivePacket(100);
+                        if (packet == null) continue;
 
-                    switch (packet.getType()) {
-                        case AUDIO_RX:
-                            rxBuffer.write(packet.getPayload());
-                            break;
-                        case CONTROL:
-                            handleControlMessage(packet);
-                            break;
-                        case HEARTBEAT:
-                            // Server heartbeat, send ack
-                            protocol.sendControl(ControlMessage.heartbeatAck());
-                            break;
-                        default:
-                            break;
+                        switch (packet.getType()) {
+                            case AUDIO_RX:
+                                rxBuffer.write(packet.getPayload());
+                                break;
+                            case CONTROL:
+                                handleControlMessage(packet);
+                                break;
+                            case HEARTBEAT:
+                                // Server heartbeat, send ack
+                                protocol.sendControl(ControlMessage.heartbeatAck());
+                                break;
+                            default:
+                                break;
+                        }
+                    } catch (IOException e) {
+                        if (!closed) {
+                            notifyError("local", "Receive error: " + e.getMessage());
+                            handleConnectionLost();
+                        }
+                        break;
                     }
-                } catch (IOException e) {
-                    if (!closed) {
-                        notifyError("local", "Receive error: " + e.getMessage());
-                        close();
-                    }
-                    break;
+                }
+            } catch (Exception e) {
+                if (!closed) {
+                    notifyError("local", "Receive thread error: " + e.getMessage());
+                    handleConnectionLost();
                 }
             }
         }, "AudioReceive");
@@ -388,63 +467,100 @@ public class AudioStreamClient {
         // Playback thread - plays RX audio to virtual device (for WSJT-X)
         playbackThread = new Thread(() -> {
             byte[] buffer = new byte[config.getBytesPerFrame()];
-            playbackLine.start();
+            try {
+                playbackLine.start();
 
-            // Initial buffering
-            while (!closed && connected && !rxBuffer.hasReachedTargetLevel()) {
+                // Initial buffering with timeout for FT8 timing requirements
+                long bufferingStart = System.currentTimeMillis();
+                long maxBufferingTime = AudioStreamConfig.MAX_INITIAL_BUFFERING_MS;
+
+                while (!closed && connected && !rxBuffer.hasReachedTargetLevel()) {
+                    long elapsed = System.currentTimeMillis() - bufferingStart;
+                    if (elapsed >= maxBufferingTime) {
+                        // Timeout - start playback with whatever buffer we have
+                        // This is critical for FT8 where RX audio must be delivered on time
+                        if (rxBuffer.getAvailable() > 0) {
+                            notifyError("local", "Initial buffering timeout after " + elapsed +
+                                "ms, starting with " + rxBuffer.getBufferLevelMs() + "ms buffer");
+                        }
+                        break;
+                    }
+                    try {
+                        Thread.sleep(10);
+                    } catch (InterruptedException e) {
+                        break;
+                    }
+                }
+
+                while (!closed && connected) {
+                    int bytesRead = rxBuffer.read(buffer, 0, buffer.length, config.getFrameDurationMs() * 2);
+                    if (bytesRead > 0) {
+                        playbackLine.write(buffer, 0, bytesRead);
+                    } else if (bytesRead == 0 && rxBuffer.getAvailable() == 0) {
+                        // Underrun - insert silence
+                        playbackLine.write(new byte[buffer.length], 0, buffer.length);
+                    }
+                }
+            } catch (Exception e) {
+                if (!closed) {
+                    notifyError("local", "Playback thread error: " + e.getMessage());
+                    handleConnectionLost();
+                }
+            } finally {
                 try {
-                    Thread.sleep(10);
-                } catch (InterruptedException e) {
-                    break;
-                }
+                    playbackLine.stop();
+                } catch (Exception ignored) {}
             }
-
-            while (!closed && connected) {
-                int bytesRead = rxBuffer.read(buffer, 0, buffer.length, config.getFrameDurationMs() * 2);
-                if (bytesRead > 0) {
-                    playbackLine.write(buffer, 0, bytesRead);
-                } else if (bytesRead == 0 && rxBuffer.getAvailable() == 0) {
-                    // Underrun - insert silence
-                    playbackLine.write(new byte[buffer.length], 0, buffer.length);
-                }
-            }
-
-            playbackLine.stop();
         }, "AudioPlayback");
         playbackThread.start();
 
         // Capture thread - captures TX audio from virtual device (from WSJT-X)
         captureThread = new Thread(() -> {
             byte[] buffer = new byte[config.getBytesPerFrame()];
-            captureLine.start();
+            try {
+                captureLine.start();
 
-            while (!closed && connected) {
-                int bytesRead = captureLine.read(buffer, 0, buffer.length);
-                if (bytesRead > 0) {
-                    txBuffer.write(buffer, 0, bytesRead);
+                while (!closed && connected) {
+                    int bytesRead = captureLine.read(buffer, 0, buffer.length);
+                    if (bytesRead > 0) {
+                        txBuffer.write(buffer, 0, bytesRead);
+                    }
                 }
+            } catch (Exception e) {
+                if (!closed) {
+                    notifyError("local", "Capture thread error: " + e.getMessage());
+                    handleConnectionLost();
+                }
+            } finally {
+                try {
+                    captureLine.stop();
+                } catch (Exception ignored) {}
             }
-
-            captureLine.stop();
         }, "AudioCapture");
         captureThread.start();
 
         // Send thread - sends TX audio to server
         sendThread = new Thread(() -> {
             byte[] buffer = new byte[config.getBytesPerFrame()];
-
-            while (!closed && connected) {
-                int bytesRead = txBuffer.read(buffer, 0, buffer.length, config.getFrameDurationMs() * 2);
-                if (bytesRead > 0) {
-                    try {
-                        protocol.sendTxAudio(buffer);
-                    } catch (IOException e) {
-                        if (!closed) {
-                            notifyError("local", "Send error: " + e.getMessage());
-                            close();
+            try {
+                while (!closed && connected) {
+                    int bytesRead = txBuffer.read(buffer, 0, buffer.length, config.getFrameDurationMs() * 2);
+                    if (bytesRead > 0) {
+                        try {
+                            protocol.sendTxAudio(buffer);
+                        } catch (IOException e) {
+                            if (!closed) {
+                                notifyError("local", "Send error: " + e.getMessage());
+                                handleConnectionLost();
+                            }
+                            break;
                         }
-                        break;
                     }
+                }
+            } catch (Exception e) {
+                if (!closed) {
+                    notifyError("local", "Send thread error: " + e.getMessage());
+                    handleConnectionLost();
                 }
             }
         }, "AudioSend");
@@ -452,32 +568,38 @@ public class AudioStreamClient {
 
         // Heartbeat thread
         heartbeatThread = new Thread(() -> {
-            while (!closed && connected) {
-                try {
-                    Thread.sleep(AudioProtocolHandler.HEARTBEAT_INTERVAL_MS);
+            try {
+                while (!closed && connected) {
+                    try {
+                        Thread.sleep(AudioProtocolHandler.HEARTBEAT_INTERVAL_MS);
 
-                    if (protocol.shouldSendHeartbeat()) {
-                        protocol.sendHeartbeat();
-                    }
+                        if (protocol.shouldSendHeartbeat()) {
+                            protocol.sendHeartbeat();
+                        }
 
-                    if (protocol.isConnectionTimedOut()) {
-                        notifyError("local", "Connection timeout");
-                        close();
+                        if (protocol.isConnectionTimedOut()) {
+                            notifyError("local", "Connection timeout");
+                            handleConnectionLost();
+                            break;
+                        }
+
+                        // Periodic latency measurement
+                        measureLatency();
+
+                        // Update statistics
+                        notifyStatisticsUpdate("local", getStats());
+
+                    } catch (InterruptedException e) {
                         break;
+                    } catch (IOException e) {
+                        if (!closed) {
+                            notifyError("local", "Heartbeat error: " + e.getMessage());
+                        }
                     }
-
-                    // Periodic latency measurement
-                    measureLatency();
-
-                    // Update statistics
-                    notifyStatisticsUpdate("local", getStats());
-
-                } catch (InterruptedException e) {
-                    break;
-                } catch (IOException e) {
-                    if (!closed) {
-                        notifyError("local", "Heartbeat error: " + e.getMessage());
-                    }
+                }
+            } catch (Exception e) {
+                if (!closed) {
+                    notifyError("local", "Heartbeat thread error: " + e.getMessage());
                 }
             }
         }, "Heartbeat");
@@ -499,11 +621,180 @@ public class AudioStreamClient {
                 if (error != null) {
                     notifyError("local", error);
                 }
-                close();
+                handleConnectionLost();
                 break;
             default:
                 break;
         }
+    }
+
+    /**
+     * Handles connection loss - triggers reconnection if enabled.
+     */
+    private void handleConnectionLost() {
+        if (closed || reconnecting) {
+            return;
+        }
+
+        // Clean up current connection
+        closeResources();
+
+        if (autoReconnect && !closed) {
+            startReconnection();
+        } else {
+            // Not auto-reconnecting - fully close
+            closed = true;
+            notifyClientDisconnected("local");
+        }
+    }
+
+    /**
+     * Starts the reconnection process in a background thread.
+     */
+    private void startReconnection() {
+        if (reconnecting) {
+            return;
+        }
+
+        reconnecting = true;
+        reconnectAttempt = 0;
+
+        reconnectThread = new Thread(() -> {
+            int currentDelay = reconnectDelayMs;
+
+            while (!closed && reconnecting && reconnectAttempt < maxReconnectAttempts) {
+                reconnectAttempt++;
+
+                notifyReconnecting("local", reconnectAttempt, maxReconnectAttempts);
+
+                try {
+                    // Wait before attempting
+                    Thread.sleep(currentDelay);
+
+                    if (closed) {
+                        break;
+                    }
+
+                    // Attempt to reconnect
+                    reconnectInternal();
+
+                    // Success - exit loop
+                    reconnecting = false;
+                    reconnectAttempt = 0;
+                    notifyReconnected("local");
+                    return;
+
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (IOException e) {
+                    notifyError("local", "Reconnect attempt " + reconnectAttempt +
+                        "/" + maxReconnectAttempts + " failed: " + e.getMessage());
+
+                    // Exponential backoff
+                    currentDelay = Math.min(currentDelay * 2, maxReconnectDelayMs);
+                }
+            }
+
+            // Failed to reconnect
+            reconnecting = false;
+            if (!closed) {
+                closed = true;
+                notifyError("local", "Failed to reconnect after " + reconnectAttempt + " attempts");
+                notifyClientDisconnected("local");
+            }
+        }, "AudioClient-Reconnect");
+        reconnectThread.start();
+    }
+
+    /**
+     * Internal reconnection - creates new socket and protocol handler.
+     */
+    private void reconnectInternal() throws IOException {
+        // Create new socket connection
+        socket = new Socket();
+        socket.connect(new java.net.InetSocketAddress(serverHost, serverPort), CONNECT_TIMEOUT_MS);
+        protocol = new AudioProtocolHandler(socket);
+        executor = Executors.newCachedThreadPool();
+        connectTime = System.currentTimeMillis();
+
+        // Perform handshake
+        if (!performHandshake()) {
+            throw new IOException("Handshake failed");
+        }
+
+        // Open audio lines
+        if (!openAudioLines()) {
+            throw new IOException("Failed to open audio devices");
+        }
+
+        connected = true;
+        notifyClientConnected("local", serverHost + ":" + serverPort);
+
+        // Start worker threads
+        startWorkerThreads();
+
+        streaming = true;
+        notifyStreamStarted("local", config);
+    }
+
+    /**
+     * Closes resources without triggering reconnection.
+     */
+    private void closeResources() {
+        streaming = false;
+        connected = false;
+
+        notifyStreamStopped("local");
+
+        // Stop threads
+        if (captureThread != null) captureThread.interrupt();
+        if (playbackThread != null) playbackThread.interrupt();
+        if (receiveThread != null) receiveThread.interrupt();
+        if (sendThread != null) sendThread.interrupt();
+        if (heartbeatThread != null) heartbeatThread.interrupt();
+
+        // Close audio lines
+        if (captureLine != null) {
+            try {
+                captureLine.stop();
+                captureLine.close();
+            } catch (Exception ignored) {}
+            captureLine = null;
+        }
+        if (playbackLine != null) {
+            try {
+                playbackLine.stop();
+                playbackLine.close();
+            } catch (Exception ignored) {}
+            playbackLine = null;
+        }
+
+        // Close protocol handler
+        if (protocol != null) {
+            try {
+                protocol.close();
+            } catch (IOException ignored) {}
+            protocol = null;
+        }
+
+        // Close socket
+        if (socket != null) {
+            try {
+                socket.close();
+            } catch (IOException ignored) {}
+            socket = null;
+        }
+
+        // Shutdown executor
+        if (executor != null) {
+            executor.shutdownNow();
+            executor = null;
+        }
+
+        // Clear buffers
+        rxBuffer = null;
+        txBuffer = null;
     }
 
     // Notification methods
@@ -552,6 +843,22 @@ public class AudioStreamClient {
         for (AudioStreamListener listener : listeners) {
             try {
                 listener.onError(clientId, error);
+            } catch (Exception ignored) {}
+        }
+    }
+
+    private void notifyReconnecting(String clientId, int attempt, int maxAttempts) {
+        for (AudioStreamListener listener : listeners) {
+            try {
+                listener.onReconnecting(clientId, attempt, maxAttempts);
+            } catch (Exception ignored) {}
+        }
+    }
+
+    private void notifyReconnected(String clientId) {
+        for (AudioStreamListener listener : listeners) {
+            try {
+                listener.onReconnected(clientId);
             } catch (Exception ignored) {}
         }
     }

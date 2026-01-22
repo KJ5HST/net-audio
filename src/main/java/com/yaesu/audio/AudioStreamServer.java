@@ -344,6 +344,7 @@ public class AudioStreamServer {
         private final AudioRingBuffer txBuffer;
         private final long connectTime;
 
+        private AudioStreamConfig sessionConfig;  // Session-specific config (may differ from server default)
         private TargetDataLine captureLine;
         private SourceDataLine playbackLine;
         private volatile boolean closed = false;
@@ -359,8 +360,9 @@ public class AudioStreamServer {
             this.clientId = clientId;
             this.socket = socket;
             this.protocol = new AudioProtocolHandler(socket);
-            this.rxBuffer = new AudioRingBuffer(config);
-            this.txBuffer = new AudioRingBuffer(config);
+            this.sessionConfig = config;  // Start with server default
+            this.rxBuffer = new AudioRingBuffer(sessionConfig);
+            this.txBuffer = new AudioRingBuffer(sessionConfig);
             this.connectTime = System.currentTimeMillis();
         }
 
@@ -381,13 +383,13 @@ public class AudioStreamServer {
                 }
 
                 // Send config and accept
-                protocol.sendControl(ControlMessage.audioConfig(config));
+                protocol.sendControl(ControlMessage.audioConfig(sessionConfig));
                 protocol.sendControl(ControlMessage.connectAccept());
 
                 // Start worker threads
                 startWorkerThreads();
 
-                notifyStreamStarted(clientId, config);
+                notifyStreamStarted(clientId, sessionConfig);
                 streaming = true;
 
                 // Main loop - handle heartbeats and statistics
@@ -434,6 +436,24 @@ public class AudioStreamServer {
                 return false;
             }
 
+            // Check if client requested specific buffer settings
+            AudioStreamConfig requestedConfig = msg.parseConnectRequestConfig();
+            if (requestedConfig != null) {
+                // Create a new config with server's audio format but client's buffer settings
+                sessionConfig = new AudioStreamConfig()
+                    .setSampleRate(config.getSampleRate())
+                    .setBitsPerSample(config.getBitsPerSample())
+                    .setChannels(config.getChannels())
+                    .setFrameDurationMs(config.getFrameDurationMs())
+                    .setBufferTargetMs(requestedConfig.getBufferTargetMs())
+                    .setBufferMinMs(requestedConfig.getBufferMinMs())
+                    .setBufferMaxMs(requestedConfig.getBufferMaxMs());
+
+                // Update ring buffers with new config
+                rxBuffer.updateConfig(sessionConfig);
+                txBuffer.updateConfig(sessionConfig);
+            }
+
             return true;
         }
 
@@ -452,13 +472,15 @@ public class AudioStreamServer {
             // Capture thread - reads from radio, sends to client
             captureThread = new Thread(() -> {
                 byte[] buffer = new byte[config.getBytesPerFrame()];
-                captureLine.start();
+                try {
+                    captureLine.start();
 
-                while (!closed && running) {
-                    int bytesRead = captureLine.read(buffer, 0, buffer.length);
-                    if (bytesRead > 0) {
+                    while (!closed && running) {
                         try {
-                            protocol.sendRxAudio(buffer);
+                            int bytesRead = captureLine.read(buffer, 0, buffer.length);
+                            if (bytesRead > 0) {
+                                protocol.sendRxAudio(buffer);
+                            }
                         } catch (IOException e) {
                             if (!closed) {
                                 notifyError(clientId, "Send error: " + e.getMessage());
@@ -467,38 +489,52 @@ public class AudioStreamServer {
                             break;
                         }
                     }
+                } catch (Exception e) {
+                    if (!closed) {
+                        notifyError(clientId, "Capture thread error: " + e.getMessage());
+                        close();
+                    }
+                } finally {
+                    try {
+                        captureLine.stop();
+                    } catch (Exception ignored) {}
                 }
-
-                captureLine.stop();
             }, "AudioCapture-" + clientId);
             captureThread.start();
 
             // Receive thread - receives from client, puts in TX buffer
             receiveThread = new Thread(() -> {
-                while (!closed && running) {
-                    try {
-                        AudioPacket packet = protocol.receivePacket(100);
-                        if (packet == null) continue;
+                try {
+                    while (!closed && running) {
+                        try {
+                            AudioPacket packet = protocol.receivePacket(100);
+                            if (packet == null) continue;
 
-                        switch (packet.getType()) {
-                            case AUDIO_TX:
-                                txBuffer.write(packet.getPayload());
-                                break;
-                            case CONTROL:
-                                handleControlMessage(packet);
-                                break;
-                            case HEARTBEAT:
-                                // Heartbeat received, connection is alive
-                                break;
-                            default:
-                                break;
+                            switch (packet.getType()) {
+                                case AUDIO_TX:
+                                    txBuffer.write(packet.getPayload());
+                                    break;
+                                case CONTROL:
+                                    handleControlMessage(packet);
+                                    break;
+                                case HEARTBEAT:
+                                    // Heartbeat received, connection is alive
+                                    break;
+                                default:
+                                    break;
+                            }
+                        } catch (IOException e) {
+                            if (!closed) {
+                                notifyError(clientId, "Receive error: " + e.getMessage());
+                                close();
+                            }
+                            break;
                         }
-                    } catch (IOException e) {
-                        if (!closed) {
-                            notifyError(clientId, "Receive error: " + e.getMessage());
-                            close();
-                        }
-                        break;
+                    }
+                } catch (Exception e) {
+                    if (!closed) {
+                        notifyError(clientId, "Receive thread error: " + e.getMessage());
+                        close();
                     }
                 }
             }, "AudioReceive-" + clientId);
@@ -507,28 +543,50 @@ public class AudioStreamServer {
             // Playback thread - reads from TX buffer, plays to radio
             playbackThread = new Thread(() -> {
                 byte[] buffer = new byte[config.getBytesPerFrame()];
-                playbackLine.start();
+                try {
+                    playbackLine.start();
 
-                // Initial buffering
-                while (!closed && running && !txBuffer.hasReachedTargetLevel()) {
+                    // Initial buffering with timeout for FT8 timing requirements
+                    long bufferingStart = System.currentTimeMillis();
+                    long maxBufferingTime = AudioStreamConfig.MAX_INITIAL_BUFFERING_MS;
+
+                    while (!closed && running && !txBuffer.hasReachedTargetLevel()) {
+                        long elapsed = System.currentTimeMillis() - bufferingStart;
+                        if (elapsed >= maxBufferingTime) {
+                            // Timeout - start playback with whatever buffer we have
+                            // This is critical for FT8 where TX must start on time
+                            if (txBuffer.getAvailable() > 0) {
+                                notifyError(clientId, "Initial buffering timeout after " + elapsed +
+                                    "ms, starting with " + txBuffer.getBufferLevelMs() + "ms buffer");
+                            }
+                            break;
+                        }
+                        try {
+                            Thread.sleep(10);
+                        } catch (InterruptedException e) {
+                            break;
+                        }
+                    }
+
+                    while (!closed && running) {
+                        int bytesRead = txBuffer.read(buffer, 0, buffer.length, config.getFrameDurationMs() * 2);
+                        if (bytesRead > 0) {
+                            playbackLine.write(buffer, 0, bytesRead);
+                        } else if (bytesRead == 0 && txBuffer.getAvailable() == 0) {
+                            // Underrun - insert silence
+                            playbackLine.write(new byte[buffer.length], 0, buffer.length);
+                        }
+                    }
+                } catch (Exception e) {
+                    if (!closed) {
+                        notifyError(clientId, "Playback thread error: " + e.getMessage());
+                        close();
+                    }
+                } finally {
                     try {
-                        Thread.sleep(10);
-                    } catch (InterruptedException e) {
-                        break;
-                    }
+                        playbackLine.stop();
+                    } catch (Exception ignored) {}
                 }
-
-                while (!closed && running) {
-                    int bytesRead = txBuffer.read(buffer, 0, buffer.length, config.getFrameDurationMs() * 2);
-                    if (bytesRead > 0) {
-                        playbackLine.write(buffer, 0, bytesRead);
-                    } else if (bytesRead == 0 && txBuffer.getAvailable() == 0) {
-                        // Underrun - insert silence
-                        playbackLine.write(new byte[buffer.length], 0, buffer.length);
-                    }
-                }
-
-                playbackLine.stop();
             }, "AudioPlayback-" + clientId);
             playbackThread.start();
         }
