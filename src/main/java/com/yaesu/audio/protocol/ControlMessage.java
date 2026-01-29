@@ -51,6 +51,16 @@ public class ControlMessage {
         LATENCY_RESPONSE((byte) 0x23),
         /** Statistics update */
         STATS_UPDATE((byte) 0x30),
+        /** TX channel granted to this client */
+        TX_GRANTED((byte) 0x40),
+        /** TX channel request denied (another client has it) */
+        TX_DENIED((byte) 0x41),
+        /** Client was preempted by higher priority client */
+        TX_PREEMPTED((byte) 0x42),
+        /** TX channel released (idle timeout or explicit) */
+        TX_RELEASED((byte) 0x43),
+        /** Client list update (broadcast to all clients) */
+        CLIENTS_UPDATE((byte) 0x44),
         /** Error notification */
         ERROR((byte) 0xFE),
         /** Graceful disconnect */
@@ -73,6 +83,74 @@ public class ControlMessage {
                 }
             }
             return null;
+        }
+    }
+
+    /**
+     * Client identification information.
+     * <p>
+     * Allows clients to identify themselves with callsign, name, and location
+     * so other connected clients can see who they're sharing the radio with.
+     * </p>
+     */
+    public static class ClientInfo {
+        private final String callsign;
+        private final String name;
+        private final String location;
+
+        public ClientInfo(String callsign, String name, String location) {
+            this.callsign = callsign != null ? callsign : "";
+            this.name = name != null ? name : "";
+            this.location = location != null ? location : "";
+        }
+
+        public String getCallsign() { return callsign; }
+        public String getName() { return name; }
+        public String getLocation() { return location; }
+
+        public boolean isEmpty() {
+            return callsign.isEmpty() && name.isEmpty() && location.isEmpty();
+        }
+
+        /**
+         * Gets a display string for this client.
+         * <p>
+         * Returns the most specific identification available:
+         * callsign (name, location), or just callsign, or just name, etc.
+         * </p>
+         */
+        public String getDisplayString() {
+            StringBuilder sb = new StringBuilder();
+            if (!callsign.isEmpty()) {
+                sb.append(callsign);
+                if (!name.isEmpty() || !location.isEmpty()) {
+                    sb.append(" (");
+                    if (!name.isEmpty()) {
+                        sb.append(name);
+                        if (!location.isEmpty()) {
+                            sb.append(", ");
+                        }
+                    }
+                    if (!location.isEmpty()) {
+                        sb.append(location);
+                    }
+                    sb.append(")");
+                }
+            } else if (!name.isEmpty()) {
+                sb.append(name);
+                if (!location.isEmpty()) {
+                    sb.append(" (").append(location).append(")");
+                }
+            } else if (!location.isEmpty()) {
+                sb.append(location);
+            }
+            return sb.toString();
+        }
+
+        @Override
+        public String toString() {
+            String display = getDisplayString();
+            return display.isEmpty() ? "Unknown" : display;
         }
     }
 
@@ -183,12 +261,29 @@ public class ControlMessage {
      * @param requestedConfig optional requested audio configuration (buffer settings)
      */
     public static ControlMessage connectRequest(String clientName, byte protocolVersion, AudioStreamConfig requestedConfig) {
+        return connectRequest(clientName, protocolVersion, requestedConfig, null);
+    }
+
+    /**
+     * Creates a connect request message with client identification and audio configuration.
+     *
+     * @param clientName optional client name (legacy, use clientInfo instead)
+     * @param protocolVersion protocol version
+     * @param requestedConfig optional requested audio configuration (buffer settings)
+     * @param clientInfo optional client identification info (callsign, name, location)
+     */
+    public static ControlMessage connectRequest(String clientName, byte protocolVersion,
+            AudioStreamConfig requestedConfig, ClientInfo clientInfo) {
         byte[] nameBytes = clientName != null ?
             clientName.getBytes(StandardCharsets.UTF_8) : new byte[0];
 
+        // Serialize client info
+        byte[] clientInfoBytes = serializeClientInfo(clientInfo);
+
         // If config provided, include buffer settings (6 bytes: target, min, max as shorts)
         int configSize = requestedConfig != null ? 6 : 0;
-        ByteBuffer buffer = ByteBuffer.allocate(3 + nameBytes.length + configSize);
+        // Format: version(1) + nameLen(1) + name + configFlag(1) + [config(6)] + clientInfoLen(1) + clientInfo
+        ByteBuffer buffer = ByteBuffer.allocate(4 + nameBytes.length + configSize + clientInfoBytes.length);
         buffer.order(ByteOrder.BIG_ENDIAN);
 
         buffer.put(protocolVersion);
@@ -206,7 +301,82 @@ public class ControlMessage {
             buffer.putShort((short) requestedConfig.getBufferMaxMs());
         }
 
+        // Client info (length-prefixed)
+        buffer.put((byte) clientInfoBytes.length);
+        if (clientInfoBytes.length > 0) {
+            buffer.put(clientInfoBytes);
+        }
+
         return new ControlMessage(Type.CONNECT_REQUEST, buffer.array());
+    }
+
+    /**
+     * Serializes ClientInfo to bytes.
+     */
+    private static byte[] serializeClientInfo(ClientInfo info) {
+        if (info == null || info.isEmpty()) {
+            return new byte[0];
+        }
+
+        byte[] callsignBytes = info.getCallsign().getBytes(StandardCharsets.UTF_8);
+        byte[] nameBytes = info.getName().getBytes(StandardCharsets.UTF_8);
+        byte[] locationBytes = info.getLocation().getBytes(StandardCharsets.UTF_8);
+
+        // Limit each field to 255 bytes
+        int callsignLen = Math.min(callsignBytes.length, 255);
+        int nameLen = Math.min(nameBytes.length, 255);
+        int locationLen = Math.min(locationBytes.length, 255);
+
+        ByteBuffer buffer = ByteBuffer.allocate(3 + callsignLen + nameLen + locationLen);
+        buffer.order(ByteOrder.BIG_ENDIAN);
+
+        buffer.put((byte) callsignLen);
+        if (callsignLen > 0) buffer.put(callsignBytes, 0, callsignLen);
+
+        buffer.put((byte) nameLen);
+        if (nameLen > 0) buffer.put(nameBytes, 0, nameLen);
+
+        buffer.put((byte) locationLen);
+        if (locationLen > 0) buffer.put(locationBytes, 0, locationLen);
+
+        return buffer.array();
+    }
+
+    /**
+     * Deserializes ClientInfo from bytes.
+     */
+    private static ClientInfo deserializeClientInfo(ByteBuffer buffer) {
+        if (buffer.remaining() < 3) {
+            return null;
+        }
+
+        int callsignLen = buffer.get() & 0xFF;
+        String callsign = "";
+        if (callsignLen > 0 && buffer.remaining() >= callsignLen) {
+            byte[] bytes = new byte[callsignLen];
+            buffer.get(bytes);
+            callsign = new String(bytes, StandardCharsets.UTF_8);
+        }
+
+        if (buffer.remaining() < 1) return new ClientInfo(callsign, "", "");
+        int nameLen = buffer.get() & 0xFF;
+        String name = "";
+        if (nameLen > 0 && buffer.remaining() >= nameLen) {
+            byte[] bytes = new byte[nameLen];
+            buffer.get(bytes);
+            name = new String(bytes, StandardCharsets.UTF_8);
+        }
+
+        if (buffer.remaining() < 1) return new ClientInfo(callsign, name, "");
+        int locationLen = buffer.get() & 0xFF;
+        String location = "";
+        if (locationLen > 0 && buffer.remaining() >= locationLen) {
+            byte[] bytes = new byte[locationLen];
+            buffer.get(bytes);
+            location = new String(bytes, StandardCharsets.UTF_8);
+        }
+
+        return new ClientInfo(callsign, name, location);
     }
 
     /**
@@ -249,6 +419,53 @@ public class ControlMessage {
         config.setBufferMaxMs(buffer.getShort() & 0xFFFF);
 
         return config;
+    }
+
+    /**
+     * Parses client identification info from a connect request message.
+     *
+     * @return the client info, or null if none was included
+     */
+    public ClientInfo parseConnectRequestClientInfo() {
+        if (type != Type.CONNECT_REQUEST || data.length < 3) {
+            return null;
+        }
+
+        ByteBuffer buffer = ByteBuffer.wrap(data);
+        buffer.order(ByteOrder.BIG_ENDIAN);
+
+        // Skip version
+        buffer.get();
+
+        // Skip client name
+        int nameLen = buffer.get() & 0xFF;
+        if (buffer.remaining() < nameLen + 1) {
+            return null;
+        }
+        buffer.position(buffer.position() + nameLen);
+
+        // Skip config flag and config data if present
+        if (buffer.remaining() < 1) {
+            return null;
+        }
+        byte hasConfig = buffer.get();
+        if (hasConfig != 0) {
+            if (buffer.remaining() < 6) {
+                return null;
+            }
+            buffer.position(buffer.position() + 6);
+        }
+
+        // Check for client info
+        if (buffer.remaining() < 1) {
+            return null;  // No client info
+        }
+        int clientInfoLen = buffer.get() & 0xFF;
+        if (clientInfoLen == 0 || buffer.remaining() < clientInfoLen) {
+            return null;
+        }
+
+        return deserializeClientInfo(buffer);
     }
 
     /**
@@ -416,10 +633,21 @@ public class ControlMessage {
      * Parses error message text.
      */
     public String parseErrorMessage() {
-        if (type != Type.ERROR || data.length == 0) {
-            return null;
+        // Handle CONNECT_REJECT messages (format: reason byte, length byte, message)
+        if (type == Type.CONNECT_REJECT && data.length >= 2) {
+            int msgLen = data[1] & 0xFF;
+            if (msgLen > 0 && data.length >= 2 + msgLen) {
+                return new String(data, 2, msgLen, StandardCharsets.UTF_8);
+            }
+            // Return reason code name if no message
+            RejectReason reason = RejectReason.fromValue(data[0]);
+            return reason != null ? reason.name() : "REJECTED";
         }
-        return new String(data, StandardCharsets.UTF_8);
+        // Handle ERROR messages (format: just the message)
+        if (type == Type.ERROR && data.length > 0) {
+            return new String(data, StandardCharsets.UTF_8);
+        }
+        return null;
     }
 
     /**
@@ -427,6 +655,235 @@ public class ControlMessage {
      */
     public static ControlMessage disconnect() {
         return new ControlMessage(Type.DISCONNECT);
+    }
+
+    /**
+     * Creates a TX granted message.
+     * <p>
+     * Sent to a client when they successfully claim the TX channel.
+     * </p>
+     */
+    public static ControlMessage txGranted() {
+        return new ControlMessage(Type.TX_GRANTED);
+    }
+
+    /**
+     * Creates a TX denied message.
+     * <p>
+     * Sent to a client when their TX audio is rejected because another
+     * client currently holds the TX channel.
+     * </p>
+     *
+     * @param holdingClientId the ID of the client holding the channel (may be null)
+     */
+    public static ControlMessage txDenied(String holdingClientId) {
+        byte[] data = holdingClientId != null ?
+            holdingClientId.getBytes(StandardCharsets.UTF_8) : new byte[0];
+        return new ControlMessage(Type.TX_DENIED, data);
+    }
+
+    /**
+     * Creates a TX preempted message.
+     * <p>
+     * Sent to a client when they lose the TX channel to a higher priority client.
+     * </p>
+     *
+     * @param preemptingClientId the ID of the preempting client (may be null)
+     */
+    public static ControlMessage txPreempted(String preemptingClientId) {
+        byte[] data = preemptingClientId != null ?
+            preemptingClientId.getBytes(StandardCharsets.UTF_8) : new byte[0];
+        return new ControlMessage(Type.TX_PREEMPTED, data);
+    }
+
+    /**
+     * Creates a TX released message.
+     * <p>
+     * Sent to a client when the TX channel they held is released
+     * (either due to idle timeout or explicit release).
+     * </p>
+     */
+    public static ControlMessage txReleased() {
+        return new ControlMessage(Type.TX_RELEASED);
+    }
+
+    /**
+     * Parses the client ID from a TX_DENIED or TX_PREEMPTED message.
+     *
+     * @return the client ID, or null if not present
+     */
+    public String parseTxClientId() {
+        if ((type != Type.TX_DENIED && type != Type.TX_PREEMPTED) || data.length == 0) {
+            return null;
+        }
+        return new String(data, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Creates a clients update message (legacy, without client info).
+     */
+    public static ControlMessage clientsUpdate(int clientCount, int maxClients,
+            String txOwner, java.util.List<String> clientIds) {
+        return clientsUpdate(clientCount, maxClients, txOwner, clientIds, null);
+    }
+
+    /**
+     * Creates a clients update message with client identification info.
+     * <p>
+     * Broadcast to all connected clients when the client list changes
+     * (connect or disconnect). Allows clients to know how many other
+     * clients are connected, who they are, and who currently owns the TX channel.
+     * </p>
+     *
+     * @param clientCount current number of connected clients
+     * @param maxClients maximum allowed clients
+     * @param txOwner client ID of current TX owner (may be null)
+     * @param clientIds list of connected client IDs (may be null or empty)
+     * @param clientInfoMap map of client ID to ClientInfo (may be null)
+     */
+    public static ControlMessage clientsUpdate(int clientCount, int maxClients,
+            String txOwner, java.util.List<String> clientIds,
+            java.util.Map<String, ClientInfo> clientInfoMap) {
+        // Format: count (1 byte) + max (1 byte) + txOwner length (1 byte) + txOwner +
+        //         numClients (1 byte) + [idLen (1 byte) + clientId + infoLen (1 byte) + clientInfo]...
+
+        byte[] txOwnerBytes = txOwner != null ? txOwner.getBytes(StandardCharsets.UTF_8) : new byte[0];
+
+        // Pre-serialize all client entries
+        java.util.List<byte[]> clientEntries = new java.util.ArrayList<>();
+        int entriesSize = 0;
+        if (clientIds != null) {
+            for (String id : clientIds) {
+                byte[] idBytes = id.getBytes(StandardCharsets.UTF_8);
+                byte[] infoBytes = new byte[0];
+                if (clientInfoMap != null && clientInfoMap.containsKey(id)) {
+                    infoBytes = serializeClientInfo(clientInfoMap.get(id));
+                }
+                // Entry: idLen(1) + id + infoLen(1) + info
+                byte[] entry = new byte[2 + idBytes.length + infoBytes.length];
+                entry[0] = (byte) idBytes.length;
+                System.arraycopy(idBytes, 0, entry, 1, idBytes.length);
+                entry[1 + idBytes.length] = (byte) infoBytes.length;
+                if (infoBytes.length > 0) {
+                    System.arraycopy(infoBytes, 0, entry, 2 + idBytes.length, infoBytes.length);
+                }
+                clientEntries.add(entry);
+                entriesSize += entry.length;
+            }
+        }
+
+        // Calculate total size
+        int size = 4 + txOwnerBytes.length + entriesSize;
+
+        ByteBuffer buffer = ByteBuffer.allocate(size);
+        buffer.order(ByteOrder.BIG_ENDIAN);
+
+        buffer.put((byte) Math.min(clientCount, 255));
+        buffer.put((byte) Math.min(maxClients, 255));
+        buffer.put((byte) txOwnerBytes.length);
+        if (txOwnerBytes.length > 0) {
+            buffer.put(txOwnerBytes);
+        }
+
+        buffer.put((byte) clientEntries.size());
+        for (byte[] entry : clientEntries) {
+            buffer.put(entry);
+        }
+
+        return new ControlMessage(Type.CLIENTS_UPDATE, buffer.array());
+    }
+
+    /**
+     * Parsed data from a CLIENTS_UPDATE message.
+     */
+    public static class ClientsUpdateInfo {
+        public final int clientCount;
+        public final int maxClients;
+        public final String txOwner;
+        public final java.util.List<String> clientIds;
+        public final java.util.Map<String, ClientInfo> clientInfoMap;
+
+        public ClientsUpdateInfo(int clientCount, int maxClients, String txOwner,
+                java.util.List<String> clientIds) {
+            this(clientCount, maxClients, txOwner, clientIds, new java.util.HashMap<>());
+        }
+
+        public ClientsUpdateInfo(int clientCount, int maxClients, String txOwner,
+                java.util.List<String> clientIds, java.util.Map<String, ClientInfo> clientInfoMap) {
+            this.clientCount = clientCount;
+            this.maxClients = maxClients;
+            this.txOwner = txOwner;
+            this.clientIds = clientIds;
+            this.clientInfoMap = clientInfoMap;
+        }
+
+        /**
+         * Gets the display string for a client ID.
+         * <p>
+         * Returns the ClientInfo display string if available, otherwise the client ID.
+         * </p>
+         */
+        public String getClientDisplayString(String clientId) {
+            ClientInfo info = clientInfoMap.get(clientId);
+            if (info != null && !info.isEmpty()) {
+                return info.getDisplayString();
+            }
+            return clientId;
+        }
+    }
+
+    /**
+     * Parses a CLIENTS_UPDATE message.
+     *
+     * @return the parsed info, or null if not a valid CLIENTS_UPDATE message
+     */
+    public ClientsUpdateInfo parseClientsUpdate() {
+        if (type != Type.CLIENTS_UPDATE || data.length < 4) {
+            return null;
+        }
+
+        ByteBuffer buffer = ByteBuffer.wrap(data);
+        buffer.order(ByteOrder.BIG_ENDIAN);
+
+        int clientCount = buffer.get() & 0xFF;
+        int maxClients = buffer.get() & 0xFF;
+
+        int txOwnerLen = buffer.get() & 0xFF;
+        String txOwner = null;
+        if (txOwnerLen > 0 && buffer.remaining() >= txOwnerLen) {
+            byte[] txOwnerBytes = new byte[txOwnerLen];
+            buffer.get(txOwnerBytes);
+            txOwner = new String(txOwnerBytes, StandardCharsets.UTF_8);
+        }
+
+        java.util.List<String> clientIds = new java.util.ArrayList<>();
+        java.util.Map<String, ClientInfo> clientInfoMap = new java.util.HashMap<>();
+
+        if (buffer.remaining() >= 1) {
+            int numClients = buffer.get() & 0xFF;
+            for (int i = 0; i < numClients && buffer.remaining() >= 1; i++) {
+                // Read client ID
+                int idLen = buffer.get() & 0xFF;
+                if (buffer.remaining() < idLen) break;
+                byte[] idBytes = new byte[idLen];
+                buffer.get(idBytes);
+                String clientId = new String(idBytes, StandardCharsets.UTF_8);
+                clientIds.add(clientId);
+
+                // Read client info if present
+                if (buffer.remaining() >= 1) {
+                    int infoLen = buffer.get() & 0xFF;
+                    if (infoLen > 0 && buffer.remaining() >= infoLen) {
+                        ClientInfo info = deserializeClientInfo(buffer);
+                        if (info != null) {
+                            clientInfoMap.put(clientId, info);
+                        }
+                    }
+                }
+            }
+        }
+
+        return new ClientsUpdateInfo(clientCount, maxClients, txOwner, clientIds, clientInfoMap);
     }
 
     // Getters

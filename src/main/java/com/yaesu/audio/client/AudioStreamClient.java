@@ -37,11 +37,22 @@ public class AudioStreamClient {
     /** Default maximum reconnection attempts */
     private static final int DEFAULT_MAX_RECONNECT_ATTEMPTS = 10;
 
+    /** Minimum stable connection time (ms) before resetting reconnect counter */
+    private static final int MIN_STABLE_CONNECTION_MS = 5000;
+
     private final String serverHost;
     private final int serverPort;
     private final String clientName;
     private final AudioDeviceManager deviceManager;
     private final List<AudioStreamListener> listeners = new CopyOnWriteArrayList<>();
+
+    // Raw audio listeners (for FFT/waterfall processing)
+    private final List<java.util.function.Consumer<byte[]>> audioListeners = new CopyOnWriteArrayList<>();
+
+    // Client identification
+    private String callsign;
+    private String operatorName;
+    private String location;
 
     private AudioStreamConfig config;
     private Socket socket;
@@ -56,12 +67,17 @@ public class AudioStreamClient {
     private SourceDataLine playbackLine;
     private AudioRingBuffer rxBuffer;
     private AudioRingBuffer txBuffer;
+    private volatile boolean captureIsMono = false; // Track mono capture for conversion
 
     private volatile boolean connected = false;
     private volatile boolean streaming = false;
     private volatile boolean closed = false;
     private volatile long measuredLatencyMs = 0;
     private long connectTime;
+
+    // Mute controls for PTT operation
+    private volatile boolean captureMuted = true;   // Start muted (RX mode)
+    private volatile boolean playbackMuted = false; // Start unmuted (hear RX)
 
     // Auto-reconnection settings
     private boolean autoReconnect = true;
@@ -71,6 +87,9 @@ public class AudioStreamClient {
     private volatile boolean reconnecting = false;
     private volatile int reconnectAttempt = 0;
     private Thread reconnectThread;
+
+    // Server client info (from CLIENTS_UPDATE messages)
+    private volatile ControlMessage.ClientsUpdateInfo serverClientsInfo;
 
     // Worker threads
     private Thread captureThread;
@@ -119,6 +138,54 @@ public class AudioStreamClient {
     }
 
     /**
+     * Sets the client's callsign for identification to other clients.
+     *
+     * @param callsign the callsign (e.g., "KJ5HST")
+     */
+    public void setCallsign(String callsign) {
+        this.callsign = callsign;
+    }
+
+    /**
+     * Gets the client's callsign.
+     */
+    public String getCallsign() {
+        return callsign;
+    }
+
+    /**
+     * Sets the operator's name for identification to other clients.
+     *
+     * @param name the operator name (e.g., "John")
+     */
+    public void setOperatorName(String name) {
+        this.operatorName = name;
+    }
+
+    /**
+     * Gets the operator's name.
+     */
+    public String getOperatorName() {
+        return operatorName;
+    }
+
+    /**
+     * Sets the client's location for identification to other clients.
+     *
+     * @param location the location (e.g., "Austin, TX" or "EM10")
+     */
+    public void setLocation(String location) {
+        this.location = location;
+    }
+
+    /**
+     * Gets the client's location.
+     */
+    public String getLocation() {
+        return location;
+    }
+
+    /**
      * Gets the audio device manager.
      */
     public AudioDeviceManager getDeviceManager() {
@@ -158,8 +225,10 @@ public class AudioStreamClient {
             throw new IllegalStateException("Already connected");
         }
 
-        if (captureDevice == null || playbackDevice == null) {
-            throw new IllegalStateException("Audio devices not configured");
+        // Playback device is required for receiving audio
+        // Capture device is optional (only needed for TX)
+        if (playbackDevice == null) {
+            throw new IllegalStateException("Playback device not configured");
         }
 
         // Connect socket
@@ -199,12 +268,14 @@ public class AudioStreamClient {
      * Disconnects from the server.
      */
     public void disconnect() {
-        if (!connected) return;
+        // Send disconnect message if connected
+        if (connected && protocol != null) {
+            try {
+                protocol.sendControl(ControlMessage.disconnect());
+            } catch (IOException ignored) {}
+        }
 
-        try {
-            protocol.sendControl(ControlMessage.disconnect());
-        } catch (IOException ignored) {}
-
+        // Always call close() to stop reconnection attempts
         close();
     }
 
@@ -281,6 +352,58 @@ public class AudioStreamClient {
     }
 
     /**
+     * Gets the number of clients connected to the server.
+     * <p>
+     * This information is updated via CLIENTS_UPDATE messages from the server.
+     * </p>
+     *
+     * @return the number of connected clients, or -1 if not yet received
+     */
+    public int getServerClientCount() {
+        ControlMessage.ClientsUpdateInfo info = serverClientsInfo;
+        return info != null ? info.clientCount : -1;
+    }
+
+    /**
+     * Gets the maximum number of clients allowed by the server.
+     *
+     * @return the max clients, or -1 if not yet received
+     */
+    public int getServerMaxClients() {
+        ControlMessage.ClientsUpdateInfo info = serverClientsInfo;
+        return info != null ? info.maxClients : -1;
+    }
+
+    /**
+     * Gets the client ID of the current TX channel owner on the server.
+     *
+     * @return the TX owner client ID, or null if no one is transmitting
+     */
+    public String getServerTxOwner() {
+        ControlMessage.ClientsUpdateInfo info = serverClientsInfo;
+        return info != null ? info.txOwner : null;
+    }
+
+    /**
+     * Gets the list of client IDs connected to the server.
+     *
+     * @return the list of client IDs, or null if not yet received
+     */
+    public java.util.List<String> getServerClientIds() {
+        ControlMessage.ClientsUpdateInfo info = serverClientsInfo;
+        return info != null ? info.clientIds : null;
+    }
+
+    /**
+     * Gets the full server clients info.
+     *
+     * @return the clients update info, or null if not yet received
+     */
+    public ControlMessage.ClientsUpdateInfo getServerClientsInfo() {
+        return serverClientsInfo;
+    }
+
+    /**
      * Enables or disables automatic reconnection on connection loss.
      * Default is enabled.
      *
@@ -343,6 +466,50 @@ public class AudioStreamClient {
     }
 
     /**
+     * Sets whether capture (TX) audio is muted.
+     * When muted, no audio is sent to the server.
+     * Use for PTT operation - unmute when transmitting.
+     */
+    public void setCaptureMuted(boolean muted) {
+        this.captureMuted = muted;
+    }
+
+    /**
+     * Checks if capture (TX) audio is muted.
+     */
+    public boolean isCaptureMuted() {
+        return captureMuted;
+    }
+
+    /**
+     * Sets whether playback (RX) audio is muted.
+     * When muted, silence is played instead of received audio.
+     * Use for PTT operation - mute when transmitting to prevent feedback.
+     */
+    public void setPlaybackMuted(boolean muted) {
+        this.playbackMuted = muted;
+    }
+
+    /**
+     * Checks if playback (RX) audio is muted.
+     */
+    public boolean isPlaybackMuted() {
+        return playbackMuted;
+    }
+
+    /**
+     * Sets PTT mode for voice operation.
+     * When PTT is active: capture unmuted (send voice), playback muted (no feedback).
+     * When PTT is inactive: capture muted (no send), playback unmuted (hear RX).
+     *
+     * @param pttActive true when PTT is pressed, false when released
+     */
+    public void setPTT(boolean pttActive) {
+        this.captureMuted = !pttActive;  // Unmute capture when PTT pressed
+        this.playbackMuted = pttActive;   // Mute playback when PTT pressed
+    }
+
+    /**
      * Adds a stream listener.
      */
     public void addStreamListener(AudioStreamListener listener) {
@@ -358,9 +525,38 @@ public class AudioStreamClient {
         listeners.remove(listener);
     }
 
+    /**
+     * Adds a raw audio listener that receives PCM audio data received from the server.
+     * This is useful for FFT/waterfall processing.
+     *
+     * @param listener the listener to add (receives byte[] PCM data)
+     */
+    public void addAudioListener(java.util.function.Consumer<byte[]> listener) {
+        if (listener != null && !audioListeners.contains(listener)) {
+            audioListeners.add(listener);
+        }
+    }
+
+    /**
+     * Removes a raw audio listener.
+     *
+     * @param listener the listener to remove
+     */
+    public void removeAudioListener(java.util.function.Consumer<byte[]> listener) {
+        audioListeners.remove(listener);
+    }
+
     private boolean performHandshake() throws IOException {
+        // Build client info if any identification is provided
+        ControlMessage.ClientInfo clientInfo = null;
+        if ((callsign != null && !callsign.isEmpty()) ||
+            (operatorName != null && !operatorName.isEmpty()) ||
+            (location != null && !location.isEmpty())) {
+            clientInfo = new ControlMessage.ClientInfo(callsign, operatorName, location);
+        }
+
         // Send connect request
-        protocol.sendControl(ControlMessage.connectRequest(clientName, AudioPacket.VERSION, config));
+        protocol.sendControl(ControlMessage.connectRequest(clientName, AudioPacket.VERSION, config, clientInfo));
 
         // Wait for response
         AudioPacket packet = protocol.receivePacket(CONNECT_TIMEOUT_MS);
@@ -411,7 +607,15 @@ public class AudioStreamClient {
             // Reinitialize device manager with server config
             AudioDeviceManager mgr = new AudioDeviceManager(config);
 
-            captureLine = mgr.openCaptureLine(captureDevice);
+            // Capture line is optional (only needed for TX)
+            if (captureDevice != null) {
+                captureLine = mgr.openCaptureLine(captureDevice);
+                // Check if capture is mono (we'll need to convert to stereo)
+                captureIsMono = captureLine.getFormat().getChannels() == 1;
+                if (captureIsMono) {
+                    System.out.println("[AudioStreamClient] Capture device is mono - will convert to stereo for TX");
+                }
+            }
             playbackLine = mgr.openPlaybackLine(playbackDevice);
 
             rxBuffer = new AudioRingBuffer(config);
@@ -427,6 +631,10 @@ public class AudioStreamClient {
     private void startWorkerThreads() {
         // Receive thread - receives RX audio from server, puts in buffer
         receiveThread = new Thread(() -> {
+            long lastLogTime = 0;
+            long rxPackets = 0;
+            long rxBytes = 0;
+
             try {
                 while (!closed && connected) {
                     try {
@@ -435,7 +643,30 @@ public class AudioStreamClient {
 
                         switch (packet.getType()) {
                             case AUDIO_RX:
-                                rxBuffer.write(packet.getPayload());
+                                byte[] payload = packet.getPayload();
+                                rxBuffer.write(payload);
+                                rxPackets++;
+                                rxBytes += payload.length;
+
+                                // Notify audio listeners (for FFT/waterfall)
+                                if (!audioListeners.isEmpty()) {
+                                    for (var listener : audioListeners) {
+                                        try {
+                                            listener.accept(payload);
+                                        } catch (Exception e) {
+                                            // Ignore listener errors
+                                        }
+                                    }
+                                }
+
+                                // Log every 5 seconds
+                                long now = System.currentTimeMillis();
+                                if (now - lastLogTime > 5000) {
+                                    System.out.println("[AudioStreamClient] Received " + rxPackets + " packets, " + rxBytes + " bytes in last 5s");
+                                    lastLogTime = now;
+                                    rxPackets = 0;
+                                    rxBytes = 0;
+                                }
                                 break;
                             case CONTROL:
                                 handleControlMessage(packet);
@@ -467,7 +698,11 @@ public class AudioStreamClient {
         // Playback thread - plays RX audio to virtual device (for WSJT-X)
         playbackThread = new Thread(() -> {
             byte[] buffer = new byte[config.getBytesPerFrame()];
+            long lastLogTime = 0;
+            long bytesWritten = 0;
+
             try {
+                System.out.println("[AudioStreamClient] Playback thread starting, device: " + playbackDevice.getName() + ", muted: " + playbackMuted);
                 playbackLine.start();
 
                 // Initial buffering with timeout for FT8 timing requirements
@@ -479,10 +714,7 @@ public class AudioStreamClient {
                     if (elapsed >= maxBufferingTime) {
                         // Timeout - start playback with whatever buffer we have
                         // This is critical for FT8 where RX audio must be delivered on time
-                        if (rxBuffer.getAvailable() > 0) {
-                            notifyError("local", "Initial buffering timeout after " + elapsed +
-                                "ms, starting with " + rxBuffer.getBufferLevelMs() + "ms buffer");
-                        }
+                        System.out.println("[AudioStreamClient] Initial buffering timeout after " + elapsed + "ms, buffer: " + rxBuffer.getAvailable() + " bytes");
                         break;
                     }
                     try {
@@ -491,11 +723,43 @@ public class AudioStreamClient {
                         break;
                     }
                 }
+                System.out.println("[AudioStreamClient] Starting playback loop");
 
                 while (!closed && connected) {
                     int bytesRead = rxBuffer.read(buffer, 0, buffer.length, config.getFrameDurationMs() * 2);
                     if (bytesRead > 0) {
-                        playbackLine.write(buffer, 0, bytesRead);
+                        if (playbackMuted) {
+                            // Muted - write silence to keep audio flowing but no sound
+                            playbackLine.write(new byte[bytesRead], 0, bytesRead);
+                        } else {
+                            playbackLine.write(buffer, 0, bytesRead);
+                            bytesWritten += bytesRead;
+
+                            // Check if data is silence (all zeros)
+                            boolean allZeros = true;
+                            for (int i = 0; i < Math.min(bytesRead, 100); i++) {
+                                if (buffer[i] != 0) {
+                                    allZeros = false;
+                                    break;
+                                }
+                            }
+                            if (allZeros && bytesWritten < 10000) {
+                                System.out.println("[AudioStreamClient] WARNING: Audio data appears to be silence!");
+                            }
+                        }
+
+                        // Log every 5 seconds
+                        long now = System.currentTimeMillis();
+                        if (now - lastLogTime > 5000) {
+                            // Sample some bytes to verify non-silence
+                            int maxVal = 0;
+                            for (int i = 0; i < Math.min(buffer.length, 100); i++) {
+                                maxVal = Math.max(maxVal, Math.abs(buffer[i]));
+                            }
+                            System.out.println("[AudioStreamClient] Playback: wrote " + bytesWritten + " bytes, muted: " + playbackMuted + ", maxSample: " + maxVal);
+                            lastLogTime = now;
+                            bytesWritten = 0;
+                        }
                     } else if (bytesRead == 0 && rxBuffer.getAvailable() == 0) {
                         // Underrun - insert silence
                         playbackLine.write(new byte[buffer.length], 0, buffer.length);
@@ -514,57 +778,80 @@ public class AudioStreamClient {
         }, "AudioPlayback");
         playbackThread.start();
 
-        // Capture thread - captures TX audio from virtual device (from WSJT-X)
-        captureThread = new Thread(() -> {
-            byte[] buffer = new byte[config.getBytesPerFrame()];
-            try {
-                captureLine.start();
+        // Capture thread - captures TX audio from virtual device (from WSJT-X or mic)
+        // Only start if capture device is configured (TX support is optional)
+        if (captureLine != null) {
+            captureThread = new Thread(() -> {
+                // For mono capture, we read half the bytes and expand to stereo
+                int readSize = captureIsMono ? config.getBytesPerFrame() / 2 : config.getBytesPerFrame();
+                byte[] readBuffer = new byte[readSize];
+                byte[] stereoBuffer = captureIsMono ? new byte[config.getBytesPerFrame()] : null;
 
-                while (!closed && connected) {
-                    int bytesRead = captureLine.read(buffer, 0, buffer.length);
-                    if (bytesRead > 0) {
-                        txBuffer.write(buffer, 0, bytesRead);
-                    }
-                }
-            } catch (Exception e) {
-                if (!closed) {
-                    notifyError("local", "Capture thread error: " + e.getMessage());
-                    handleConnectionLost();
-                }
-            } finally {
                 try {
-                    captureLine.stop();
-                } catch (Exception ignored) {}
-            }
-        }, "AudioCapture");
-        captureThread.start();
+                    captureLine.start();
 
-        // Send thread - sends TX audio to server
-        sendThread = new Thread(() -> {
-            byte[] buffer = new byte[config.getBytesPerFrame()];
-            try {
-                while (!closed && connected) {
-                    int bytesRead = txBuffer.read(buffer, 0, buffer.length, config.getFrameDurationMs() * 2);
-                    if (bytesRead > 0) {
-                        try {
-                            protocol.sendTxAudio(buffer);
-                        } catch (IOException e) {
-                            if (!closed) {
-                                notifyError("local", "Send error: " + e.getMessage());
-                                handleConnectionLost();
+                    while (!closed && connected) {
+                        int bytesRead = captureLine.read(readBuffer, 0, readBuffer.length);
+                        if (bytesRead > 0 && !captureMuted) {
+                            if (captureIsMono) {
+                                // Convert mono to stereo by duplicating each sample
+                                // For 16-bit audio: each sample is 2 bytes
+                                int stereoBytes = 0;
+                                for (int i = 0; i < bytesRead; i += 2) {
+                                    // Copy sample to left channel
+                                    stereoBuffer[stereoBytes++] = readBuffer[i];
+                                    stereoBuffer[stereoBytes++] = readBuffer[i + 1];
+                                    // Copy same sample to right channel
+                                    stereoBuffer[stereoBytes++] = readBuffer[i];
+                                    stereoBuffer[stereoBytes++] = readBuffer[i + 1];
+                                }
+                                txBuffer.write(stereoBuffer, 0, stereoBytes);
+                            } else {
+                                // Already stereo, write directly
+                                txBuffer.write(readBuffer, 0, bytesRead);
                             }
-                            break;
                         }
                     }
+                } catch (Exception e) {
+                    if (!closed) {
+                        notifyError("local", "Capture thread error: " + e.getMessage());
+                        handleConnectionLost();
+                    }
+                } finally {
+                    try {
+                        captureLine.stop();
+                    } catch (Exception ignored) {}
                 }
-            } catch (Exception e) {
-                if (!closed) {
-                    notifyError("local", "Send thread error: " + e.getMessage());
-                    handleConnectionLost();
+            }, "AudioCapture");
+            captureThread.start();
+
+            // Send thread - sends TX audio to server
+            sendThread = new Thread(() -> {
+                byte[] buffer = new byte[config.getBytesPerFrame()];
+                try {
+                    while (!closed && connected) {
+                        int bytesRead = txBuffer.read(buffer, 0, buffer.length, config.getFrameDurationMs() * 2);
+                        if (bytesRead > 0) {
+                            try {
+                                protocol.sendTxAudio(buffer);
+                            } catch (IOException e) {
+                                if (!closed) {
+                                    notifyError("local", "Send error: " + e.getMessage());
+                                    handleConnectionLost();
+                                }
+                                break;
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    if (!closed) {
+                        notifyError("local", "Send thread error: " + e.getMessage());
+                        handleConnectionLost();
+                    }
                 }
-            }
-        }, "AudioSend");
-        sendThread.start();
+            }, "AudioSend");
+            sendThread.start();
+        }
 
         // Heartbeat thread
         heartbeatThread = new Thread(() -> {
@@ -615,6 +902,25 @@ public class AudioStreamClient {
                 long sent = msg.parseLatencyTimestamp();
                 measuredLatencyMs = (System.nanoTime() - sent) / 1_000_000 / 2;
                 break;
+            case CLIENTS_UPDATE:
+                ControlMessage.ClientsUpdateInfo info = msg.parseClientsUpdate();
+                if (info != null) {
+                    serverClientsInfo = info;
+                    notifyClientsUpdate(info);
+                }
+                break;
+            case TX_GRANTED:
+                notifyTxGranted();
+                break;
+            case TX_DENIED:
+                notifyTxDenied(msg.parseTxClientId());
+                break;
+            case TX_PREEMPTED:
+                notifyTxPreempted(msg.parseTxClientId());
+                break;
+            case TX_RELEASED:
+                notifyTxReleased();
+                break;
             case DISCONNECT:
             case ERROR:
                 String error = msg.parseErrorMessage();
@@ -636,10 +942,29 @@ public class AudioStreamClient {
             return;
         }
 
+        // Check if connection was short-lived (unstable)
+        long connectionDuration = System.currentTimeMillis() - connectTime;
+        boolean wasShortLived = connectionDuration < MIN_STABLE_CONNECTION_MS;
+
         // Clean up current connection
         closeResources();
 
         if (autoReconnect && !closed) {
+            if (wasShortLived) {
+                // Short-lived connection - increment attempt counter
+                // This prevents endless reconnect loops when connection keeps failing immediately
+                reconnectAttempt++;
+                if (reconnectAttempt >= maxReconnectAttempts) {
+                    closed = true;
+                    notifyError("local", "Connection unstable - failed " + reconnectAttempt +
+                        " times within " + MIN_STABLE_CONNECTION_MS + "ms of connecting");
+                    notifyClientDisconnected("local");
+                    return;
+                }
+            } else {
+                // Connection was stable - reset attempt counter for fresh start
+                reconnectAttempt = 0;
+            }
             startReconnection();
         } else {
             // Not auto-reconnecting - fully close
@@ -652,12 +977,13 @@ public class AudioStreamClient {
      * Starts the reconnection process in a background thread.
      */
     private void startReconnection() {
-        if (reconnecting) {
+        if (closed || reconnecting) {
             return;
         }
 
         reconnecting = true;
-        reconnectAttempt = 0;
+        // Don't reset reconnectAttempt - it may have been incremented by handleConnectionLost
+        // for short-lived connections
 
         reconnectThread = new Thread(() -> {
             int currentDelay = reconnectDelayMs;
@@ -678,9 +1004,11 @@ public class AudioStreamClient {
                     // Attempt to reconnect
                     reconnectInternal();
 
-                    // Success - exit loop
+                    // Success - exit loop but don't reset reconnectAttempt yet.
+                    // If connection fails quickly, handleConnectionLost will track it.
+                    // If connection stays stable > MIN_STABLE_CONNECTION_MS,
+                    // handleConnectionLost will reset reconnectAttempt to 0.
                     reconnecting = false;
-                    reconnectAttempt = 0;
                     notifyReconnected("local");
                     return;
 
@@ -859,6 +1187,46 @@ public class AudioStreamClient {
         for (AudioStreamListener listener : listeners) {
             try {
                 listener.onReconnected(clientId);
+            } catch (Exception ignored) {}
+        }
+    }
+
+    private void notifyClientsUpdate(ControlMessage.ClientsUpdateInfo info) {
+        for (AudioStreamListener listener : listeners) {
+            try {
+                listener.onClientsUpdate(info.clientCount, info.maxClients, info.txOwner, info.clientIds);
+            } catch (Exception ignored) {}
+        }
+    }
+
+    private void notifyTxGranted() {
+        for (AudioStreamListener listener : listeners) {
+            try {
+                listener.onTxGranted();
+            } catch (Exception ignored) {}
+        }
+    }
+
+    private void notifyTxDenied(String holdingClientId) {
+        for (AudioStreamListener listener : listeners) {
+            try {
+                listener.onTxDenied(holdingClientId);
+            } catch (Exception ignored) {}
+        }
+    }
+
+    private void notifyTxPreempted(String preemptingClientId) {
+        for (AudioStreamListener listener : listeners) {
+            try {
+                listener.onTxPreempted(preemptingClientId);
+            } catch (Exception ignored) {}
+        }
+    }
+
+    private void notifyTxReleased() {
+        for (AudioStreamListener listener : listeners) {
+            try {
+                listener.onTxReleased();
             } catch (Exception ignored) {}
         }
     }

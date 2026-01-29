@@ -27,8 +27,8 @@ public class AudioStreamConfig {
     /** Default bits per sample */
     public static final int DEFAULT_BITS_PER_SAMPLE = 16;
 
-    /** Mono audio for digital modes */
-    public static final int DEFAULT_CHANNELS = 1;
+    /** Stereo audio (USB Audio Device requires stereo at 48kHz) */
+    public static final int DEFAULT_CHANNELS = 2;
 
     /** Default frame duration in milliseconds */
     public static final int DEFAULT_FRAME_MS = 20;
@@ -66,7 +66,15 @@ public class AudioStreamConfig {
     /** Default audio server port */
     public static final int DEFAULT_PORT = 4533;
 
+    /** Default maximum number of simultaneous clients */
+    public static final int DEFAULT_MAX_CLIENTS = 4;
+
+    /** Default TX idle timeout in milliseconds before channel is released */
+    public static final long DEFAULT_TX_IDLE_TIMEOUT_MS = 500;
+
     private int sampleRate;
+    private int maxClients;
+    private long txIdleTimeoutMs;
     private int bitsPerSample;
     private int channels;
     private int frameDurationMs;
@@ -85,6 +93,8 @@ public class AudioStreamConfig {
         this.bufferTargetMs = DEFAULT_BUFFER_TARGET_MS;
         this.bufferMinMs = DEFAULT_BUFFER_MIN_MS;
         this.bufferMaxMs = DEFAULT_BUFFER_MAX_MS;
+        this.maxClients = DEFAULT_MAX_CLIENTS;
+        this.txIdleTimeoutMs = DEFAULT_TX_IDLE_TIMEOUT_MS;
     }
 
     /**
@@ -189,6 +199,41 @@ public class AudioStreamConfig {
      */
     public AudioStreamConfig setBufferMaxMs(int bufferMaxMs) {
         this.bufferMaxMs = bufferMaxMs;
+        return this;
+    }
+
+    /**
+     * Gets the maximum number of simultaneous clients.
+     */
+    public int getMaxClients() {
+        return maxClients;
+    }
+
+    /**
+     * Sets the maximum number of simultaneous clients.
+     */
+    public AudioStreamConfig setMaxClients(int maxClients) {
+        this.maxClients = maxClients;
+        return this;
+    }
+
+    /**
+     * Gets the TX idle timeout in milliseconds.
+     * <p>
+     * After a client stops transmitting, this is the delay before the TX channel
+     * is released and another client can claim it. This provides hysteresis to
+     * prevent rapid transmitter switching.
+     * </p>
+     */
+    public long getTxIdleTimeoutMs() {
+        return txIdleTimeoutMs;
+    }
+
+    /**
+     * Sets the TX idle timeout in milliseconds.
+     */
+    public AudioStreamConfig setTxIdleTimeoutMs(long txIdleTimeoutMs) {
+        this.txIdleTimeoutMs = txIdleTimeoutMs;
         return this;
     }
 
@@ -309,8 +354,8 @@ public class AudioStreamConfig {
 
     @Override
     public String toString() {
-        return String.format("AudioStreamConfig[%dHz, %d-bit, %dch, %dms frames, buffer %d-%d-%dms]",
+        return String.format("AudioStreamConfig[%dHz, %d-bit, %dch, %dms frames, buffer %d-%d-%dms, max %d clients]",
             sampleRate, bitsPerSample, channels, frameDurationMs,
-            bufferMinMs, bufferTargetMs, bufferMaxMs);
+            bufferMinMs, bufferTargetMs, bufferMaxMs, maxClients);
     }
 }

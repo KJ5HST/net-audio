@@ -94,6 +94,26 @@ public class AudioProtocolHandler implements Closeable {
     }
 
     /**
+     * Sends an RX audio frame from a portion of a buffer.
+     *
+     * @param audioData the audio data buffer
+     * @param offset the offset in the buffer
+     * @param length the number of bytes to send
+     * @throws IOException if sending fails
+     */
+    public void sendRxAudio(byte[] audioData, int offset, int length) throws IOException {
+        byte[] data;
+        if (offset == 0 && length == audioData.length) {
+            data = audioData;
+        } else {
+            data = new byte[length];
+            System.arraycopy(audioData, offset, data, 0, length);
+        }
+        AudioPacket packet = AudioPacket.createRxAudio(sequenceCounter.getAndIncrement(), data);
+        sendPacket(packet);
+    }
+
+    /**
      * Sends a TX audio frame.
      *
      * @param audioData the audio data to send
@@ -168,6 +188,10 @@ public class AudioProtocolHandler implements Closeable {
             // Get payload length (at offset 17)
             int payloadLen = ((header[17] & 0xFF) << 8) | (header[18] & 0xFF);
             if (payloadLen > AudioPacket.MAX_PAYLOAD) {
+                // Payload too large - must skip the payload + CRC to stay in sync with stream
+                byte[] skip = new byte[payloadLen + AudioPacket.CRC_SIZE];
+                input.readFully(skip);
+
                 consecutiveCrcErrors++;
                 crcErrors++;
                 if (consecutiveCrcErrors >= MAX_CONSECUTIVE_CRC_ERRORS) {

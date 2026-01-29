@@ -21,7 +21,7 @@ class AudioStreamConfigTest {
 
         assertEquals(48000, config.getSampleRate());
         assertEquals(16, config.getBitsPerSample());
-        assertEquals(1, config.getChannels());
+        assertEquals(2, config.getChannels());  // Stereo for USB Audio Device compatibility
         assertEquals(20, config.getFrameDurationMs());
     }
 
@@ -29,10 +29,10 @@ class AudioStreamConfigTest {
     void testBytesPerFrameCalculation() {
         AudioStreamConfig config = new AudioStreamConfig();
 
-        // 48000 Hz * 16 bits * 1 channel * 20ms = 1920 bytes
+        // 48000 Hz * 16 bits * 2 channels * 20ms = 3840 bytes
         // Sample rate / 1000 * frame duration * bytes per sample * channels
-        // 48000 / 1000 * 20 * 2 * 1 = 1920
-        assertEquals(1920, config.getBytesPerFrame());
+        // 48000 / 1000 * 20 * 2 * 2 = 3840
+        assertEquals(3840, config.getBytesPerFrame());
     }
 
     @Test
@@ -47,8 +47,8 @@ class AudioStreamConfigTest {
     void testBytesPerSecondCalculation() {
         AudioStreamConfig config = new AudioStreamConfig();
 
-        // 48000 Hz * 2 bytes * 1 channel = 96000 bytes/sec
-        assertEquals(96000, config.getBytesPerSecond());
+        // 48000 Hz * 2 bytes * 2 channels = 192000 bytes/sec
+        assertEquals(192000, config.getBytesPerSecond());
     }
 
     @Test
@@ -59,7 +59,7 @@ class AudioStreamConfigTest {
         assertNotNull(format);
         assertEquals(48000, format.getSampleRate(), 0.01);
         assertEquals(16, format.getSampleSizeInBits());
-        assertEquals(1, format.getChannels());
+        assertEquals(2, format.getChannels());  // Stereo for USB Audio Device compatibility
         assertTrue(format.getEncoding() == AudioFormat.Encoding.PCM_SIGNED);
     }
 
@@ -67,8 +67,8 @@ class AudioStreamConfigTest {
     void testMsToBytes() {
         AudioStreamConfig config = new AudioStreamConfig();
 
-        // 100ms at 96000 bytes/sec = 9600 bytes
-        assertEquals(9600, config.msToBytes(100));
+        // 100ms at 192000 bytes/sec = 19200 bytes
+        assertEquals(19200, config.msToBytes(100));
         assertEquals(0, config.msToBytes(0));
     }
 
@@ -76,8 +76,8 @@ class AudioStreamConfigTest {
     void testBytesToMs() {
         AudioStreamConfig config = new AudioStreamConfig();
 
-        // 9600 bytes at 96000 bytes/sec = 100ms
-        assertEquals(100, config.bytesToMs(9600));
+        // 19200 bytes at 192000 bytes/sec = 100ms
+        assertEquals(100, config.bytesToMs(19200));
         assertEquals(0, config.bytesToMs(0));
     }
 
@@ -93,5 +93,52 @@ class AudioStreamConfigTest {
         assertTrue(config.getBufferMaxMs() > 0);
         assertTrue(config.getBufferTargetMs() > 0);
         assertTrue(config.getBufferTargetMs() <= config.getBufferMaxMs());
+    }
+
+    @Test
+    void testDefaultMaxClients() {
+        AudioStreamConfig config = new AudioStreamConfig();
+        assertEquals(4, config.getMaxClients());
+        assertEquals(AudioStreamConfig.DEFAULT_MAX_CLIENTS, config.getMaxClients());
+    }
+
+    @Test
+    void testSetMaxClients() {
+        AudioStreamConfig config = new AudioStreamConfig();
+        config.setMaxClients(10);
+        assertEquals(10, config.getMaxClients());
+    }
+
+    @Test
+    void testDefaultTxIdleTimeout() {
+        AudioStreamConfig config = new AudioStreamConfig();
+        assertEquals(500, config.getTxIdleTimeoutMs());
+        assertEquals(AudioStreamConfig.DEFAULT_TX_IDLE_TIMEOUT_MS, config.getTxIdleTimeoutMs());
+    }
+
+    @Test
+    void testSetTxIdleTimeout() {
+        AudioStreamConfig config = new AudioStreamConfig();
+        config.setTxIdleTimeoutMs(1000);
+        assertEquals(1000, config.getTxIdleTimeoutMs());
+    }
+
+    @Test
+    void testChainedConfiguration() {
+        AudioStreamConfig config = new AudioStreamConfig()
+            .setMaxClients(8)
+            .setTxIdleTimeoutMs(750)
+            .setSampleRate(12000);
+
+        assertEquals(8, config.getMaxClients());
+        assertEquals(750, config.getTxIdleTimeoutMs());
+        assertEquals(12000, config.getSampleRate());
+    }
+
+    @Test
+    void testToStringIncludesMaxClients() {
+        AudioStreamConfig config = new AudioStreamConfig().setMaxClients(6);
+        String str = config.toString();
+        assertTrue(str.contains("6 clients"), "toString should include max clients: " + str);
     }
 }

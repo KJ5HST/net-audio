@@ -127,10 +127,10 @@ AudioDeviceInfo virtual = mgr.findVirtualCaptureDevice();
 ### Packet Format
 
 ```
-+--------+--------+--------+--------+--------+--------+---...---+--------+
-| Magic  | Ver    | Type   | SeqNum | PayloadLen      | Payload | CRC32  |
-| 0xAF01 | 1 byte | 1 byte | 4 byte | 4 bytes         | 0-8192  | 4 byte |
-+--------+--------+--------+--------+-----------------+---------+--------+
++--------+--------+--------+--------+-----------+---------+--------+
+| Magic  | Ver    | Type   | SeqNum | PayloadLen| Payload | CRC32  |
+| 0xAF01 | 1 byte | 1 byte | 4 byte | 2 bytes   | 0-8192  | 4 byte |
++--------+--------+--------+--------+-----------+---------+--------+
 ```
 
 ### Packet Types
@@ -240,7 +240,7 @@ If virtual audio is not detected:
 ## Testing
 
 ```bash
-mvn test    # 44 unit tests
+mvn test    # 73 unit tests
 ```
 
 Tests cover:

@@ -20,7 +20,7 @@ net-audio provides infrastructure for streaming audio between applications over 
 <dependency>
     <groupId>com.yaesu</groupId>
     <artifactId>net-audio</artifactId>
-    <version>1.2.0</version>
+    <version>1.2.1</version>
 </dependency>
 ```
 
@@ -120,25 +120,87 @@ AudioStreamServer server = new AudioStreamServer(4533, config);
 
 ## Virtual Audio Setup
 
-For bridging audio between applications, you'll need virtual audio devices:
+For bridging audio between applications, you'll need virtual audio devices configured for **48000 Hz**.
 
-### macOS
+### Using VirtualAudioBridge
+
+The `VirtualAudioBridge` class provides platform-aware virtual audio support:
+
+```java
+import com.yaesu.audio.client.VirtualAudioBridge;
+
+VirtualAudioBridge bridge = new VirtualAudioBridge(deviceManager);
+
+// Get platform-specific setup instructions
+System.out.println(bridge.getInstallInstructions());
+
+// Find best virtual devices
+AudioDeviceInfo capture = bridge.findBestCaptureDevice();
+AudioDeviceInfo playback = bridge.findBestPlaybackDevice();
+
+// Verify configuration (checks sample rate, channels)
+VirtualAudioBridge.VerificationResult result = bridge.verifyDeviceConfiguration(capture, true);
+if (!result.isSuccess()) {
+    System.out.println("Issues: " + result.getIssues());
+    System.out.println("Suggestions: " + result.getSuggestions());
+}
+
+// Generate detailed diagnostic report
+System.out.println(bridge.generateEnhancedDiagnosticReport());
+
+// Linux only: auto-configure virtual audio
+if (bridge.getPlatform() == VirtualAudioBridge.Platform.LINUX) {
+    VirtualAudioBridge.ConfigurationResult configResult = bridge.autoConfigureLinux();
+    if (configResult.isSuccess()) {
+        System.out.println("Virtual audio configured: " + configResult.getSinkName());
+    }
+}
+```
+
+### Platform-Specific Installation
+
+**macOS (BlackHole):**
 ```bash
 brew install blackhole-2ch
 ```
-Select "BlackHole 2ch" in your application's audio settings.
+Then configure in Audio MIDI Setup:
+1. Open `/Applications/Utilities/Audio MIDI Setup.app`
+2. Select "BlackHole 2ch"
+3. Set Format to **48000 Hz**
 
-### Windows
-Download and install [VB-Cable](https://vb-audio.com/Cable/).
-Use "CABLE Input" for capture, "CABLE Output" for playback.
+**Windows (VB-Cable):**
+1. Download from [vb-audio.com/Cable](https://vb-audio.com/Cable/)
+2. Install as Administrator
+3. Configure both devices to **48000 Hz, 16-bit** in Sound settings
 
-### Linux
+**Linux (PulseAudio/PipeWire):**
 ```bash
-# PulseAudio
-pactl load-module module-null-sink sink_name=virtual sink_properties=device.description=Virtual_Audio
+# Create virtual sink with correct sample rate
+pactl load-module module-null-sink \
+    sink_name=ftx1_audio \
+    sink_properties=device.description=FTX1_Virtual_Audio \
+    rate=48000 channels=1 format=s16le
 
-# PipeWire (modern distros)
-# Virtual devices often available by default
+# Create loopback for bidirectional audio
+pactl load-module module-loopback \
+    source=ftx1_audio.monitor \
+    sink=ftx1_audio \
+    latency_msec=20
+```
+
+Or use `autoConfigureLinux()` to create automatically.
+
+### Audio Optimization Profiles
+
+```java
+// For FT8/digital modes - minimize latency (40ms buffer)
+AudioStreamConfig config = AudioStreamConfig.ft8Optimized();
+
+// For SSB voice - stability over WiFi/Internet (120ms buffer)
+AudioStreamConfig config = AudioStreamConfig.voiceOptimized();
+
+// Balanced default (100ms buffer)
+AudioStreamConfig config = new AudioStreamConfig();
 ```
 
 ## Protocol
@@ -166,21 +228,32 @@ Default port: **4533**
 
 ```
 com.yaesu.audio
-├── AudioStreamConfig       # Audio format configuration
+├── AudioStreamConfig       # Audio format configuration (with optimization profiles)
 ├── AudioStreamStats        # Streaming statistics
-├── AudioRingBuffer         # Thread-safe circular buffer
+├── AudioRingBuffer         # Thread-safe circular buffer with jitter compensation
 ├── AudioDeviceInfo         # Device metadata
-├── AudioDeviceManager      # Device discovery
+├── AudioDeviceManager      # Device discovery and classification
 ├── AudioStreamListener     # Event observer interface
-├── AudioStreamServer       # TCP server
+├── AudioStreamServer       # TCP server (multi-client support)
+├── AudioBroadcaster        # RX audio broadcast (1 → many clients)
+├── AudioMixer              # TX arbitration (many → 1 with priority)
 ├── client/
-│   ├── AudioStreamClient   # TCP client
-│   └── VirtualAudioBridge  # Virtual device helpers
+│   ├── AudioStreamClient   # TCP client with auto-reconnect
+│   └── VirtualAudioBridge  # Virtual device detection, verification, and configuration
+│       ├── VerificationResult   # Device configuration check results
+│       └── ConfigurationResult  # Auto-configure results (Linux)
 └── protocol/
     ├── AudioPacket         # Packet serialization
-    ├── ControlMessage      # Control protocol
+    ├── ControlMessage      # Control protocol (connect, TX arbitration, client info)
     └── AudioProtocolHandler # Socket I/O
 ```
+
+### Multi-Client Support
+
+The server supports multiple simultaneous clients (default: 4):
+- **RX Audio**: Broadcast from single capture to all clients
+- **TX Audio**: Priority-based arbitration (first-come-first-served, preemption)
+- **Client Identification**: Callsign, name, location visible to server and other clients
 
 ## License
 

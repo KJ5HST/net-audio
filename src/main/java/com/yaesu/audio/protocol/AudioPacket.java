@@ -43,8 +43,8 @@ public class AudioPacket {
     /** CRC size in bytes */
     public static final int CRC_SIZE = 4;
 
-    /** Maximum payload size */
-    public static final int MAX_PAYLOAD = 8192;
+    /** Maximum payload size (16KB to support 50ms audio chunks at 48kHz stereo 16-bit = 9600 bytes) */
+    public static final int MAX_PAYLOAD = 16384;
 
     /**
      * Packet types.

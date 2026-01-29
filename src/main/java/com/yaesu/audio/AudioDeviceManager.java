@@ -165,6 +165,11 @@ public class AudioDeviceManager {
 
     /**
      * Opens a TargetDataLine for audio capture from the specified device.
+     * <p>
+     * If the device doesn't support stereo capture, this will attempt to open
+     * a mono line instead. The caller should check {@link TargetDataLine#getFormat()}
+     * to determine the actual format and convert to stereo if needed.
+     * </p>
      *
      * @param device the device to open
      * @return the opened TargetDataLine
@@ -172,12 +177,38 @@ public class AudioDeviceManager {
      */
     public TargetDataLine openCaptureLine(AudioDeviceInfo device) throws LineUnavailableException {
         AudioFormat format = config.toAudioFormat();
-        DataLine.Info info = new DataLine.Info(TargetDataLine.class, format);
-
         Mixer mixer = AudioSystem.getMixer(device.getMixerInfo());
-        TargetDataLine line = (TargetDataLine) mixer.getLine(info);
-        line.open(format);
-        return line;
+
+        // Try stereo first
+        DataLine.Info stereoInfo = new DataLine.Info(TargetDataLine.class, format);
+        if (mixer.isLineSupported(stereoInfo)) {
+            System.out.println("[AudioDeviceManager] Opening capture (stereo): " + device.getName());
+            TargetDataLine line = (TargetDataLine) mixer.getLine(stereoInfo);
+            line.open(format);
+            System.out.println("[AudioDeviceManager] Capture line opened: " + line.getFormat());
+            return line;
+        }
+
+        // Fall back to mono (many microphones are mono only)
+        AudioFormat monoFormat = new AudioFormat(
+            format.getEncoding(),
+            format.getSampleRate(),
+            format.getSampleSizeInBits(),
+            1, // mono
+            format.getFrameSize() / 2,
+            format.getFrameRate(),
+            format.isBigEndian()
+        );
+        DataLine.Info monoInfo = new DataLine.Info(TargetDataLine.class, monoFormat);
+        if (mixer.isLineSupported(monoInfo)) {
+            System.out.println("[AudioDeviceManager] Opening capture (mono, will convert to stereo): " + device.getName());
+            TargetDataLine line = (TargetDataLine) mixer.getLine(monoInfo);
+            line.open(monoFormat);
+            System.out.println("[AudioDeviceManager] Capture line opened: " + line.getFormat());
+            return line;
+        }
+
+        throw new LineUnavailableException("Device does not support required audio format: " + device.getName());
     }
 
     /**
@@ -191,9 +222,15 @@ public class AudioDeviceManager {
         AudioFormat format = config.toAudioFormat();
         DataLine.Info info = new DataLine.Info(SourceDataLine.class, format);
 
+        System.out.println("[AudioDeviceManager] Opening playback: " + device.getName() +
+            ", format: " + format.getSampleRate() + "Hz/" + format.getSampleSizeInBits() + "bit/" + format.getChannels() + "ch");
+
         Mixer mixer = AudioSystem.getMixer(device.getMixerInfo());
+        System.out.println("[AudioDeviceManager] Mixer: " + mixer.getMixerInfo().getName());
+
         SourceDataLine line = (SourceDataLine) mixer.getLine(info);
         line.open(format);
+        System.out.println("[AudioDeviceManager] Line opened: " + line.getFormat());
         return line;
     }
 
@@ -242,7 +279,25 @@ public class AudioDeviceManager {
 
     private boolean supportsCapture(Mixer mixer, AudioFormat format) {
         DataLine.Info targetInfo = new DataLine.Info(TargetDataLine.class, format);
-        return mixer.isLineSupported(targetInfo);
+        if (mixer.isLineSupported(targetInfo)) {
+            return true;
+        }
+        // Also check for mono capture - many microphones are mono only
+        // We'll convert mono to stereo during streaming if needed
+        if (format.getChannels() == 2) {
+            AudioFormat monoFormat = new AudioFormat(
+                format.getEncoding(),
+                format.getSampleRate(),
+                format.getSampleSizeInBits(),
+                1, // mono
+                format.getFrameSize() / 2, // half frame size for mono
+                format.getFrameRate(),
+                format.isBigEndian()
+            );
+            DataLine.Info monoInfo = new DataLine.Info(TargetDataLine.class, monoFormat);
+            return mixer.isLineSupported(monoInfo);
+        }
+        return false;
     }
 
     private boolean supportsPlayback(Mixer mixer, AudioFormat format) {

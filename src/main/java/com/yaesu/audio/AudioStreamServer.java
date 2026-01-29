@@ -13,20 +13,33 @@ import javax.sound.sampled.*;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.logging.Logger;
 
 /**
- * TCP server for bidirectional audio streaming.
+ * TCP server for bidirectional audio streaming with multi-client support.
  * <p>
  * Captures audio from the FTX-1 USB audio interface and streams it to
- * connected clients. Also receives audio from clients and plays it to
- * the FTX-1 for transmission.
+ * all connected clients. Also receives audio from clients and plays it to
+ * the FTX-1 for transmission using priority-based TX arbitration.
+ * </p>
+ * <p>
+ * Key features:
+ * <ul>
+ *   <li>Multiple simultaneous clients (configurable max, default 4)</li>
+ *   <li>Single capture thread broadcasts RX audio to all clients</li>
+ *   <li>TX arbitration with priority levels and idle timeout</li>
+ *   <li>Backward compatible with single-client deployments</li>
+ * </ul>
  * </p>
  */
 public class AudioStreamServer {
+
+    private static final Logger logger = Logger.getLogger(AudioStreamServer.class.getName());
 
     private final int port;
     private final AudioStreamConfig config;
@@ -41,10 +54,20 @@ public class AudioStreamServer {
     // Audio devices
     private AudioDeviceInfo captureDevice;
     private AudioDeviceInfo playbackDevice;
+    private volatile boolean injectOnlyMode = false;
 
-    // Current client session (single client supported for now)
-    // Using AtomicReference to prevent race condition when multiple clients connect simultaneously
-    private final AtomicReference<ClientSession> currentSession = new AtomicReference<>();
+    // Shared audio resources
+    private TargetDataLine captureLine;
+    private SourceDataLine playbackLine;
+    private AudioBroadcaster broadcaster;
+    private AudioMixer mixer;
+
+    // Client sessions (supports multiple concurrent clients)
+    private final ConcurrentHashMap<String, ClientSession> sessions = new ConcurrentHashMap<>();
+
+    // Raw audio listeners (for FFT/waterfall processing)
+    private final List<java.util.function.Consumer<byte[]>> audioListeners = new CopyOnWriteArrayList<>();
+    private AudioBroadcaster.BroadcastTarget audioListenerTarget;
 
     /**
      * Creates a new audio stream server.
@@ -79,6 +102,21 @@ public class AudioStreamServer {
      */
     public void setPlaybackDevice(AudioDeviceInfo device) {
         this.playbackDevice = device;
+    }
+
+    /**
+     * Enables inject-only mode where audio comes from injectAudio() instead of a capture device.
+     * This is useful for demo/test mode without physical hardware.
+     */
+    public void setInjectOnlyMode(boolean injectOnly) {
+        this.injectOnlyMode = injectOnly;
+    }
+
+    /**
+     * Checks if inject-only mode is enabled.
+     */
+    public boolean isInjectOnlyMode() {
+        return injectOnlyMode;
     }
 
     /**
@@ -121,6 +159,9 @@ public class AudioStreamServer {
         executor = Executors.newCachedThreadPool();
         running = true;
 
+        // Initialize shared audio resources
+        initializeSharedAudio();
+
         // Accept connections in a thread
         executor.submit(this::acceptLoop);
 
@@ -131,11 +172,16 @@ public class AudioStreamServer {
      * Stops the audio server.
      */
     public void stop() {
-        // Close current session
-        ClientSession session = currentSession.getAndSet(null);
-        if (session != null) {
+        running = false;
+
+        // Close all sessions
+        for (ClientSession session : sessions.values()) {
             session.close();
         }
+        sessions.clear();
+
+        // Stop shared audio resources
+        stopSharedAudio();
 
         // Close server socket to unblock accept()
         ServerSocket socketToClose = serverSocket;
@@ -146,8 +192,6 @@ public class AudioStreamServer {
                 socketToClose.close();
             } catch (IOException ignored) {}
         }
-
-        running = false;
 
         if (executor != null) {
             executor.shutdownNow();
@@ -169,22 +213,71 @@ public class AudioStreamServer {
     }
 
     /**
-     * Checks if a client is connected.
+     * Checks if any client is connected.
      */
     public boolean hasClient() {
-        ClientSession session = currentSession.get();
-        return session != null && !session.isClosed();
+        return !sessions.isEmpty();
     }
 
     /**
-     * Gets the current client statistics.
+     * Gets the number of connected clients.
      */
-    public AudioStreamStats getClientStats() {
-        ClientSession session = currentSession.get();
+    public int getClientCount() {
+        return sessions.size();
+    }
+
+    /**
+     * Gets the list of connected client IDs.
+     */
+    public List<String> getConnectedClientIds() {
+        return new ArrayList<>(sessions.keySet());
+    }
+
+    /**
+     * Gets statistics for a specific client.
+     *
+     * @param clientId the client identifier
+     * @return the statistics, or null if client not found
+     */
+    public AudioStreamStats getClientStats(String clientId) {
+        ClientSession session = sessions.get(clientId);
         if (session != null) {
             return session.getStats();
         }
         return null;
+    }
+
+    /**
+     * Gets statistics for the first connected client (backward compatibility).
+     *
+     * @deprecated Use {@link #getClientStats(String)} or {@link #getAllClientStats()} instead
+     */
+    @Deprecated
+    public AudioStreamStats getClientStats() {
+        if (sessions.isEmpty()) {
+            return null;
+        }
+        return sessions.values().iterator().next().getStats();
+    }
+
+    /**
+     * Gets statistics for all connected clients.
+     *
+     * @return map of client ID to statistics
+     */
+    public Map<String, AudioStreamStats> getAllClientStats() {
+        ConcurrentHashMap<String, AudioStreamStats> stats = new ConcurrentHashMap<>();
+        sessions.forEach((id, session) -> stats.put(id, session.getStats()));
+        return stats;
+    }
+
+    /**
+     * Gets the current TX channel owner.
+     *
+     * @return the client ID holding the TX channel, or null if none
+     */
+    public String getTxOwner() {
+        return mixer != null ? mixer.getCurrentTxOwner() : null;
     }
 
     /**
@@ -201,6 +294,142 @@ public class AudioStreamServer {
      */
     public void removeStreamListener(AudioStreamListener listener) {
         listeners.remove(listener);
+    }
+
+    /**
+     * Adds a raw audio listener that receives PCM audio data from the capture device.
+     * This is useful for FFT/waterfall processing without being a full client.
+     *
+     * @param listener the listener to add (receives byte[] PCM data)
+     */
+    public void addAudioListener(java.util.function.Consumer<byte[]> listener) {
+        if (listener != null && !audioListeners.contains(listener)) {
+            audioListeners.add(listener);
+
+            // Create broadcast target on first listener
+            if (audioListenerTarget == null && broadcaster != null) {
+                audioListenerTarget = new AudioBroadcaster.BroadcastTarget() {
+                    @Override
+                    public boolean receiveRxAudio(byte[] data, int offset, int length) {
+                        byte[] copy = new byte[length];
+                        System.arraycopy(data, offset, copy, 0, length);
+                        for (var l : audioListeners) {
+                            try {
+                                l.accept(copy);
+                            } catch (Exception e) {
+                                logger.warning("Audio listener error: " + e.getMessage());
+                            }
+                        }
+                        return true;
+                    }
+
+                    @Override
+                    public String getTargetId() {
+                        return "audio-listener-target";
+                    }
+                };
+                broadcaster.addTarget(audioListenerTarget);
+                logger.info("Added audio listener target to broadcaster");
+            }
+        }
+    }
+
+    /**
+     * Removes a raw audio listener.
+     *
+     * @param listener the listener to remove
+     */
+    public void removeAudioListener(java.util.function.Consumer<byte[]> listener) {
+        audioListeners.remove(listener);
+
+        // Remove broadcast target when no more listeners
+        if (audioListeners.isEmpty() && audioListenerTarget != null && broadcaster != null) {
+            broadcaster.removeTarget(audioListenerTarget.getTargetId());
+            audioListenerTarget = null;
+            logger.info("Removed audio listener target from broadcaster");
+        }
+    }
+
+    /**
+     * Injects audio data to be broadcast to all connected clients.
+     * This allows playback of recordings without going through the capture device.
+     *
+     * @param data the PCM audio data to broadcast
+     */
+    public void injectAudio(byte[] data) {
+        if (broadcaster != null && data != null && data.length > 0) {
+            broadcaster.injectAudio(data);
+        }
+    }
+
+    private void initializeSharedAudio() {
+        // Create broadcaster and mixer (even if devices not configured yet)
+        broadcaster = new AudioBroadcaster(config);
+        broadcaster.setBroadcastListener((targetId, reason) -> {
+            // Target failed - close the session
+            ClientSession session = sessions.get(targetId);
+            if (session != null) {
+                session.close();
+            }
+        });
+
+        mixer = new AudioMixer(config);
+        mixer.setMixerListener(new AudioMixer.MixerListener() {
+            @Override
+            public void onTxConflict(String holdingClientId, String requestingClientId) {
+                logger.fine("TX conflict: " + requestingClientId + " blocked by " + holdingClientId);
+            }
+
+            @Override
+            public void onTxOwnerChanged(String newOwnerClientId) {
+                logger.fine("TX owner changed to: " + newOwnerClientId);
+                // Broadcast TX owner change to all clients
+                broadcastClientsUpdate();
+            }
+        });
+
+        // Open audio lines if capture device is configured (playback is optional)
+        if (captureDevice != null) {
+            try {
+                openSharedAudioLines();
+            } catch (LineUnavailableException e) {
+                logger.warning("Failed to open audio lines: " + e.getMessage());
+            }
+        }
+    }
+
+    private void openSharedAudioLines() throws LineUnavailableException {
+        if (captureLine == null && captureDevice != null) {
+            captureLine = deviceManager.openCaptureLine(captureDevice);
+            broadcaster.start(captureLine);
+        }
+
+        if (playbackLine == null && playbackDevice != null) {
+            playbackLine = deviceManager.openPlaybackLine(playbackDevice);
+            mixer.start(playbackLine);
+        }
+    }
+
+    private void stopSharedAudio() {
+        if (broadcaster != null) {
+            broadcaster.stop();
+            broadcaster = null;
+        }
+
+        if (mixer != null) {
+            mixer.stop();
+            mixer = null;
+        }
+
+        if (captureLine != null) {
+            captureLine.close();
+            captureLine = null;
+        }
+
+        if (playbackLine != null) {
+            playbackLine.close();
+            playbackLine = null;
+        }
     }
 
     private void acceptLoop() {
@@ -220,51 +449,86 @@ public class AudioStreamServer {
         String clientId = "audio-" + clientIdCounter.getAndIncrement();
         String address = socket.getRemoteSocketAddress().toString();
 
-        // Check if audio devices are configured
-        if (captureDevice == null || playbackDevice == null) {
-            try {
-                AudioProtocolHandler handler = new AudioProtocolHandler(socket);
-                handler.sendControl(ControlMessage.connectReject(
-                    ControlMessage.RejectReason.REJECTED, "Audio devices not configured"));
-                handler.close();
-            } catch (IOException ignored) {}
+        // Check if capture device is configured (playback is optional for RX-only servers)
+        // In inject-only mode, we don't need a capture device - audio comes via injectAudio()
+        if (captureDevice == null && !injectOnlyMode) {
+            rejectClient(socket, ControlMessage.RejectReason.REJECTED, "Capture device not configured");
             return;
         }
 
-        // Create and start session - use atomic compareAndSet to prevent race condition
+        // Check max clients limit
+        if (sessions.size() >= config.getMaxClients()) {
+            rejectClient(socket, ControlMessage.RejectReason.BUSY,
+                "Maximum clients (" + config.getMaxClients() + ") reached");
+            return;
+        }
+
+        // Ensure shared audio lines are open
         try {
-            ClientSession newSession = new ClientSession(clientId, socket);
+            openSharedAudioLines();
+        } catch (LineUnavailableException e) {
+            rejectClient(socket, ControlMessage.RejectReason.REJECTED,
+                "Audio devices unavailable: " + e.getMessage());
+            return;
+        }
 
-            // Atomically check and set the session
-            // Loop to handle case where old session was closed
-            while (true) {
-                ClientSession existing = currentSession.get();
-                if (existing != null && !existing.isClosed()) {
-                    // Active session exists - reject new client
-                    try {
-                        AudioProtocolHandler handler = new AudioProtocolHandler(socket);
-                        handler.sendControl(ControlMessage.connectReject(
-                            ControlMessage.RejectReason.BUSY, "Another client is already connected"));
-                        handler.close();
-                    } catch (IOException ignored) {}
-                    return;
-                }
-
-                // Try to atomically set the new session
-                if (currentSession.compareAndSet(existing, newSession)) {
-                    // Success - we own this slot
-                    notifyClientConnected(clientId, address);
-                    executor.submit(newSession);
-                    return;
-                }
-                // CAS failed - another thread beat us, retry the check
-            }
+        // Create and start session
+        try {
+            ClientSession session = new ClientSession(clientId, socket);
+            sessions.put(clientId, session);
+            notifyClientConnected(clientId, address);
+            executor.submit(session);
         } catch (Exception e) {
             notifyError(clientId, "Failed to create session: " + e.getMessage());
             try {
                 socket.close();
             } catch (IOException ignored) {}
         }
+    }
+
+    private void rejectClient(Socket socket, ControlMessage.RejectReason reason, String message) {
+        try {
+            AudioProtocolHandler handler = new AudioProtocolHandler(socket);
+            handler.sendControl(ControlMessage.connectReject(reason, message));
+            handler.close();
+        } catch (IOException ignored) {}
+    }
+
+    /**
+     * Broadcasts a clients update message to all connected clients.
+     * <p>
+     * Called when clients connect, disconnect, or TX ownership changes.
+     * </p>
+     */
+    private void broadcastClientsUpdate() {
+        if (sessions.isEmpty()) {
+            return;
+        }
+
+        String txOwner = mixer != null ? mixer.getCurrentTxOwner() : null;
+        List<String> clientIds = getConnectedClientIds();
+
+        // Collect client info for all sessions
+        java.util.Map<String, ControlMessage.ClientInfo> clientInfoMap = new java.util.HashMap<>();
+        sessions.forEach((id, session) -> {
+            ControlMessage.ClientInfo info = session.getClientInfo();
+            if (info != null) {
+                clientInfoMap.put(id, info);
+            }
+        });
+
+        ControlMessage update = ControlMessage.clientsUpdate(
+            sessions.size(),
+            config.getMaxClients(),
+            txOwner,
+            clientIds,
+            clientInfoMap
+        );
+
+        // Send to all sessions
+        sessions.forEach((id, session) -> {
+            session.sendControlMessage(update);
+        });
     }
 
     // Notification methods
@@ -335,25 +599,34 @@ public class AudioStreamServer {
 
     /**
      * Handles a single client session with bidirectional audio streaming.
+     * <p>
+     * In multi-client mode, sessions share the AudioBroadcaster for RX
+     * and AudioMixer for TX rather than having their own audio lines.
+     * </p>
      */
-    private class ClientSession implements Runnable {
+    private class ClientSession implements Runnable,
+            AudioBroadcaster.BroadcastTarget, AudioMixer.TxClient {
+
         private final String clientId;
         private final Socket socket;
         private final AudioProtocolHandler protocol;
-        private final AudioRingBuffer rxBuffer;
-        private final AudioRingBuffer txBuffer;
         private final long connectTime;
 
-        private AudioStreamConfig sessionConfig;  // Session-specific config (may differ from server default)
-        private TargetDataLine captureLine;
-        private SourceDataLine playbackLine;
+        private AudioStreamConfig sessionConfig;
         private volatile boolean closed = false;
         private volatile boolean streaming = false;
         private volatile long measuredLatencyMs = 0;
+        private volatile AudioMixer.TxPriority txPriority = AudioMixer.TxPriority.NORMAL;
 
-        // Worker threads
-        private Thread captureThread;
-        private Thread playbackThread;
+        // Client identification
+        private volatile ControlMessage.ClientInfo clientInfo;
+
+        // Statistics tracking
+        private volatile long txBytesSubmitted = 0;
+        private volatile long txBytesAccepted = 0;
+        private volatile int txDeniedCount = 0;
+
+        // Worker thread
         private Thread receiveThread;
 
         ClientSession(String clientId, Socket socket) throws IOException {
@@ -361,9 +634,11 @@ public class AudioStreamServer {
             this.socket = socket;
             this.protocol = new AudioProtocolHandler(socket);
             this.sessionConfig = config;  // Start with server default
-            this.rxBuffer = new AudioRingBuffer(sessionConfig);
-            this.txBuffer = new AudioRingBuffer(sessionConfig);
             this.connectTime = System.currentTimeMillis();
+        }
+
+        ControlMessage.ClientInfo getClientInfo() {
+            return clientInfo;
         }
 
         @Override
@@ -375,22 +650,22 @@ public class AudioStreamServer {
                     return;
                 }
 
-                // Open audio lines
-                if (!openAudioLines()) {
-                    protocol.sendControl(ControlMessage.error("Failed to open audio devices"));
-                    close();
-                    return;
-                }
-
                 // Send config and accept
                 protocol.sendControl(ControlMessage.audioConfig(sessionConfig));
                 protocol.sendControl(ControlMessage.connectAccept());
 
-                // Start worker threads
-                startWorkerThreads();
+                // Register with broadcaster and mixer
+                broadcaster.addTarget(this);
+                mixer.registerClient(this);
+
+                // Start receive thread
+                startReceiveThread();
 
                 notifyStreamStarted(clientId, sessionConfig);
                 streaming = true;
+
+                // Notify all clients about the new connection
+                broadcastClientsUpdate();
 
                 // Main loop - handle heartbeats and statistics
                 while (!closed && running) {
@@ -420,7 +695,8 @@ public class AudioStreamServer {
                 notifyStreamStopped(clientId);
                 close();
                 notifyClientDisconnected(clientId);
-                currentSession.compareAndSet(this, null);
+                // Notify remaining clients about the disconnection
+                broadcastClientsUpdate();
             }
         }
 
@@ -448,61 +724,18 @@ public class AudioStreamServer {
                     .setBufferTargetMs(requestedConfig.getBufferTargetMs())
                     .setBufferMinMs(requestedConfig.getBufferMinMs())
                     .setBufferMaxMs(requestedConfig.getBufferMaxMs());
+            }
 
-                // Update ring buffers with new config
-                rxBuffer.updateConfig(sessionConfig);
-                txBuffer.updateConfig(sessionConfig);
+            // Parse client identification info
+            clientInfo = msg.parseConnectRequestClientInfo();
+            if (clientInfo != null && !clientInfo.isEmpty()) {
+                logger.info("Client " + clientId + " identified as: " + clientInfo);
             }
 
             return true;
         }
 
-        private boolean openAudioLines() {
-            try {
-                captureLine = deviceManager.openCaptureLine(captureDevice);
-                playbackLine = deviceManager.openPlaybackLine(playbackDevice);
-                return true;
-            } catch (LineUnavailableException e) {
-                notifyError(clientId, "Audio line unavailable: " + e.getMessage());
-                return false;
-            }
-        }
-
-        private void startWorkerThreads() {
-            // Capture thread - reads from radio, sends to client
-            captureThread = new Thread(() -> {
-                byte[] buffer = new byte[config.getBytesPerFrame()];
-                try {
-                    captureLine.start();
-
-                    while (!closed && running) {
-                        try {
-                            int bytesRead = captureLine.read(buffer, 0, buffer.length);
-                            if (bytesRead > 0) {
-                                protocol.sendRxAudio(buffer);
-                            }
-                        } catch (IOException e) {
-                            if (!closed) {
-                                notifyError(clientId, "Send error: " + e.getMessage());
-                                close();
-                            }
-                            break;
-                        }
-                    }
-                } catch (Exception e) {
-                    if (!closed) {
-                        notifyError(clientId, "Capture thread error: " + e.getMessage());
-                        close();
-                    }
-                } finally {
-                    try {
-                        captureLine.stop();
-                    } catch (Exception ignored) {}
-                }
-            }, "AudioCapture-" + clientId);
-            captureThread.start();
-
-            // Receive thread - receives from client, puts in TX buffer
+        private void startReceiveThread() {
             receiveThread = new Thread(() -> {
                 try {
                     while (!closed && running) {
@@ -512,7 +745,7 @@ public class AudioStreamServer {
 
                             switch (packet.getType()) {
                                 case AUDIO_TX:
-                                    txBuffer.write(packet.getPayload());
+                                    handleTxAudio(packet.getPayload());
                                     break;
                                 case CONTROL:
                                     handleControlMessage(packet);
@@ -539,56 +772,29 @@ public class AudioStreamServer {
                 }
             }, "AudioReceive-" + clientId);
             receiveThread.start();
+        }
 
-            // Playback thread - reads from TX buffer, plays to radio
-            playbackThread = new Thread(() -> {
-                byte[] buffer = new byte[config.getBytesPerFrame()];
-                try {
-                    playbackLine.start();
+        private void handleTxAudio(byte[] data) {
+            txBytesSubmitted += data.length;
 
-                    // Initial buffering with timeout for FT8 timing requirements
-                    long bufferingStart = System.currentTimeMillis();
-                    long maxBufferingTime = AudioStreamConfig.MAX_INITIAL_BUFFERING_MS;
-
-                    while (!closed && running && !txBuffer.hasReachedTargetLevel()) {
-                        long elapsed = System.currentTimeMillis() - bufferingStart;
-                        if (elapsed >= maxBufferingTime) {
-                            // Timeout - start playback with whatever buffer we have
-                            // This is critical for FT8 where TX must start on time
-                            if (txBuffer.getAvailable() > 0) {
-                                notifyError(clientId, "Initial buffering timeout after " + elapsed +
-                                    "ms, starting with " + txBuffer.getBufferLevelMs() + "ms buffer");
-                            }
-                            break;
-                        }
+            AudioMixer.TxResult result = mixer.submitTxAudio(clientId, data);
+            switch (result) {
+                case ACCEPTED:
+                    txBytesAccepted += data.length;
+                    break;
+                case REJECTED:
+                    txDeniedCount++;
+                    // Send TX_DENIED control message (first time only, to avoid spam)
+                    if (txDeniedCount == 1) {
                         try {
-                            Thread.sleep(10);
-                        } catch (InterruptedException e) {
-                            break;
-                        }
+                            protocol.sendControl(ControlMessage.txDenied(mixer.getCurrentTxOwner()));
+                        } catch (IOException ignored) {}
                     }
-
-                    while (!closed && running) {
-                        int bytesRead = txBuffer.read(buffer, 0, buffer.length, config.getFrameDurationMs() * 2);
-                        if (bytesRead > 0) {
-                            playbackLine.write(buffer, 0, bytesRead);
-                        } else if (bytesRead == 0 && txBuffer.getAvailable() == 0) {
-                            // Underrun - insert silence
-                            playbackLine.write(new byte[buffer.length], 0, buffer.length);
-                        }
-                    }
-                } catch (Exception e) {
-                    if (!closed) {
-                        notifyError(clientId, "Playback thread error: " + e.getMessage());
-                        close();
-                    }
-                } finally {
-                    try {
-                        playbackLine.stop();
-                    } catch (Exception ignored) {}
-                }
-            }, "AudioPlayback-" + clientId);
-            playbackThread.start();
+                    break;
+                case PREEMPTED:
+                    // Notification handled via TxClient callback
+                    break;
+            }
         }
 
         private void handleControlMessage(AudioPacket packet) throws IOException {
@@ -616,7 +822,78 @@ public class AudioStreamServer {
             }
         }
 
+        // BroadcastTarget implementation
+
+        @Override
+        public boolean receiveRxAudio(byte[] data, int offset, int length) {
+            if (closed) {
+                return false;
+            }
+            try {
+                protocol.sendRxAudio(data, offset, length);
+                return true;
+            } catch (IOException e) {
+                // Failed to send - mark for removal
+                return false;
+            }
+        }
+
+        @Override
+        public String getTargetId() {
+            return clientId;
+        }
+
+        // TxClient implementation
+
+        @Override
+        public String getClientId() {
+            return clientId;
+        }
+
+        @Override
+        public AudioMixer.TxPriority getTxPriority() {
+            return txPriority;
+        }
+
+        @Override
+        public void onPreempted(String preemptingClientId) {
+            try {
+                protocol.sendControl(ControlMessage.txPreempted(preemptingClientId));
+            } catch (IOException ignored) {}
+        }
+
+        @Override
+        public void onTxGranted() {
+            try {
+                protocol.sendControl(ControlMessage.txGranted());
+            } catch (IOException ignored) {}
+            // Reset denied count when we get the channel
+            txDeniedCount = 0;
+        }
+
+        @Override
+        public void onTxReleased() {
+            try {
+                protocol.sendControl(ControlMessage.txReleased());
+            } catch (IOException ignored) {}
+        }
+
+        /**
+         * Sends a control message to this client.
+         */
+        void sendControlMessage(ControlMessage message) {
+            if (closed || !streaming) {
+                return;
+            }
+            try {
+                protocol.sendControl(message);
+            } catch (IOException e) {
+                // Failed to send - will be cleaned up by receive thread
+            }
+        }
+
         AudioStreamStats getStats() {
+            AudioRingBuffer txBuffer = mixer.getTxBuffer();
             return new AudioStreamStats()
                 .setBytesReceived(protocol.getBytesReceived())
                 .setBytesSent(protocol.getBytesSent())
@@ -640,19 +917,20 @@ public class AudioStreamServer {
             if (closed) return;
             closed = true;
 
-            // Stop threads
-            if (captureThread != null) captureThread.interrupt();
-            if (receiveThread != null) receiveThread.interrupt();
-            if (playbackThread != null) playbackThread.interrupt();
-
-            // Close audio lines
-            if (captureLine != null) {
-                captureLine.stop();
-                captureLine.close();
+            // Unregister from broadcaster and mixer
+            if (broadcaster != null) {
+                broadcaster.removeTarget(clientId);
             }
-            if (playbackLine != null) {
-                playbackLine.stop();
-                playbackLine.close();
+            if (mixer != null) {
+                mixer.unregisterClient(clientId);
+            }
+
+            // Remove from sessions map
+            sessions.remove(clientId);
+
+            // Stop receive thread
+            if (receiveThread != null) {
+                receiveThread.interrupt();
             }
 
             // Close protocol handler

@@ -88,4 +88,46 @@ public interface AudioStreamListener {
      * @param clientId identifier for the client connection
      */
     default void onReconnected(String clientId) {}
+
+    // ========== Multi-client events (client-side only) ==========
+
+    /**
+     * Called when the server broadcasts an update about connected clients.
+     * <p>
+     * This allows clients to know how many other clients are connected and
+     * who currently owns the TX channel.
+     * </p>
+     *
+     * @param clientCount current number of connected clients
+     * @param maxClients maximum allowed clients
+     * @param txOwner client ID of current TX owner (null if no one is transmitting)
+     * @param clientIds list of connected client IDs
+     */
+    default void onClientsUpdate(int clientCount, int maxClients, String txOwner,
+            java.util.List<String> clientIds) {}
+
+    /**
+     * Called when this client is granted the TX channel.
+     */
+    default void onTxGranted() {}
+
+    /**
+     * Called when this client's TX audio is denied because another client
+     * holds the TX channel.
+     *
+     * @param holdingClientId the client ID that currently holds the channel
+     */
+    default void onTxDenied(String holdingClientId) {}
+
+    /**
+     * Called when this client is preempted by a higher priority client.
+     *
+     * @param preemptingClientId the client ID that preempted this client
+     */
+    default void onTxPreempted(String preemptingClientId) {}
+
+    /**
+     * Called when this client's TX channel is released (idle timeout or explicit).
+     */
+    default void onTxReleased() {}
 }
