@@ -235,12 +235,37 @@ public class AudioBroadcaster {
                     // Log every 5 seconds
                     long now = System.currentTimeMillis();
                     if (now - lastLogTime > 5000) {
-                        // Check max sample value to verify real audio
-                        int maxVal = 0;
-                        for (int i = 0; i < Math.min(bytesRead, 200); i++) {
-                            maxVal = Math.max(maxVal, Math.abs(buffer[i]));
+                        // Analyze both stereo channels from raw captured bytes
+                        int channels = config.getChannels();
+                        int bytesPerSample = config.getBitsPerSample() / 8;
+                        int frameSize = bytesPerSample * channels;
+                        int framesToCheck = Math.min(bytesRead / frameSize, 100);
+                        int leftMax = 0, rightMax = 0;
+                        int leftNonZero = 0, rightNonZero = 0;
+                        for (int f = 0; f < framesToCheck; f++) {
+                            int o = f * frameSize;
+                            if (channels >= 1 && bytesPerSample == 2) {
+                                short left = (short) ((buffer[o + 1] << 8) | (buffer[o] & 0xFF));
+                                leftMax = Math.max(leftMax, Math.abs(left));
+                                if (left != 0) leftNonZero++;
+                            }
+                            if (channels >= 2 && bytesPerSample == 2) {
+                                short right = (short) ((buffer[o + 3] << 8) | (buffer[o + 2] & 0xFF));
+                                rightMax = Math.max(rightMax, Math.abs(right));
+                                if (right != 0) rightNonZero++;
+                            }
                         }
-                        logger.info("Broadcaster: captured " + totalBytesRead + " bytes, " + targets.size() + " targets, maxSample: " + maxVal);
+                        String captureFormat = captureLine.getFormat().toString();
+                        // Print first 3 frames (12 bytes) for comparison with AudioWebSocket
+                        StringBuilder firstBytes = new StringBuilder();
+                        for (int b = 0; b < Math.min(12, bytesRead); b++) {
+                            firstBytes.append(String.format("%02X ", buffer[b] & 0xFF));
+                        }
+                        logger.info("Broadcaster: captured " + totalBytesRead + " bytes, " + targets.size() + " targets" +
+                            ", format=" + captureFormat +
+                            ", L_max=" + leftMax + " L_nz=" + leftNonZero + "/" + framesToCheck +
+                            ", R_max=" + rightMax + " R_nz=" + rightNonZero + "/" + framesToCheck +
+                            ", first12=" + firstBytes.toString().trim());
                         lastLogTime = now;
                         totalBytesRead = 0;
                     }
