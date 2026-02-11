@@ -362,6 +362,21 @@ public class AudioStreamServer {
         }
     }
 
+    /**
+     * Plays audio to the local playback device (e.g., radio USB audio input for digital TX).
+     * Routes through the mixer's TX buffer so it doesn't conflict with the mixer's playback loop.
+     *
+     * @param data the PCM audio data to play to the radio
+     */
+    public void playLocalAudio(byte[] data) {
+        if (mixer != null && mixer.isRunning() && data != null && data.length > 0) {
+            mixer.getTxBuffer().write(data, 0, data.length);
+        } else if (playbackLine != null && data != null && data.length > 0) {
+            // Fallback: write directly if mixer not running
+            playbackLine.write(data, 0, data.length);
+        }
+    }
+
     private void initializeSharedAudio() {
         // Create broadcaster and mixer (even if devices not configured yet)
         broadcaster = new AudioBroadcaster(config);
