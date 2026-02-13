@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with th
 
 ## Module Overview
 
-Generic TCP-based bidirectional audio streaming library for Java. Provides real-time audio transport with jitter compensation, multi-client support, and TX arbitration. Used by ftx1-control and ftx1-web for remote radio operation.
+Generic TCP-based bidirectional audio streaming library for Java. Provides real-time audio transport with jitter compensation, multi-client support, and TX arbitration. Used by ftx1-web for remote radio operation.
 
 **Key Characteristics:**
 - No external dependencies (Java 17 standard library only)
