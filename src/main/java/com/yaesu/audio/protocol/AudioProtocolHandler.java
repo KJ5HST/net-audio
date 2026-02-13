@@ -172,15 +172,37 @@ public class AudioProtocolHandler implements Closeable {
             headerBuf.order(ByteOrder.BIG_ENDIAN);
             short magic = headerBuf.getShort();
             if (magic != AudioPacket.MAGIC) {
-                // Invalid magic - try to resync by reading byte-by-byte
-                // This can happen after packet loss on noisy networks
+                // Invalid magic - scan for magic bytes to resync the stream
                 consecutiveCrcErrors++;
                 crcErrors++;
                 if (consecutiveCrcErrors >= MAX_CONSECUTIVE_CRC_ERRORS) {
                     throw new IOException("Too many consecutive packet errors (" +
                         consecutiveCrcErrors + "), connection may be corrupted");
                 }
-                return null; // Skip this packet, let caller retry
+
+                // Search remaining header bytes for start of magic sequence
+                byte magicHi = (byte) ((AudioPacket.MAGIC >> 8) & 0xFF);
+                byte magicLo = (byte) (AudioPacket.MAGIC & 0xFF);
+                boolean found = false;
+
+                for (int i = 1; i < header.length - 1; i++) {
+                    if (header[i] == magicHi && header[i + 1] == magicLo) {
+                        // Found magic at offset i — rebuild header
+                        int kept = header.length - i;
+                        byte[] newHeader = new byte[AudioPacket.HEADER_SIZE];
+                        System.arraycopy(header, i, newHeader, 0, kept);
+                        input.readFully(newHeader, kept, AudioPacket.HEADER_SIZE - kept);
+                        header = newHeader;
+                        headerBuf = ByteBuffer.wrap(header);
+                        headerBuf.order(ByteOrder.BIG_ENDIAN);
+                        found = true;
+                        break;
+                    }
+                }
+
+                if (!found) {
+                    return null; // No magic found in this header, caller retries
+                }
             }
 
             // Get payload length (at offset 17)
