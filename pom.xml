@@ -14,8 +14,9 @@
 
     <licenses>
         <license>
-            <name>GNU Lesser General Public License v2.1</name>
-            <url>https://www.gnu.org/licenses/lgpl-2.1.html</url>
+            <name>Commercial License</name>
+            <url>https://github.com/kj5hst/rad-con/blob/main/LICENSE</url>
+            <comments>Proprietary. All rights reserved.</comments>
         </license>
     </licenses>
 

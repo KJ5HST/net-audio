@@ -257,7 +257,7 @@ The server supports multiple simultaneous clients (default: 4):
 
 ## License
 
-LGPL v2.1 - See [LICENSE](LICENSE) for details.
+Proprietary - See [LICENSE](LICENSE) for details.
 
 ## Author
 

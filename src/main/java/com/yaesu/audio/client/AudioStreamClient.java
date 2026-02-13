@@ -1,9 +1,7 @@
 /*
- * Net-Audio Streaming Library
- * Copyright (c) 2025 by Terrell Deppe (KJ5HST)
- *
- * This library is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public License.
+ * Copyright (c) 2025-2026 Terrell Deppe (KJ5HST). All rights reserved.
+ * This software is proprietary and confidential.
+ * Unauthorized use is strictly prohibited.
  */
 package com.yaesu.audio.client;
 

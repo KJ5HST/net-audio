@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Net-Audio Streaming Library - Generic TCP-based bidirectional audio streaming. This module provides reusable audio infrastructure for capturing, streaming, and playing audio over a network connection.
 
-Author: Terrell Deppe (KJ5HST) | License: LGPL v2.1
+Author: Terrell Deppe (KJ5HST) | License: Proprietary (Commercial)
 
 ## Build Commands
 

@@ -1,6 +1,7 @@
 /*
- * Net-Audio Streaming Library
- * Copyright (c) 2025 by Terrell Deppe (KJ5HST)
+ * Copyright (c) 2025-2026 Terrell Deppe (KJ5HST). All rights reserved.
+ * This software is proprietary and confidential.
+ * Unauthorized use is strictly prohibited.
  */
 package com.yaesu.audio;
 
