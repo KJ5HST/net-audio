@@ -13,6 +13,7 @@ import java.io.IOException;
 import java.net.Socket;
 import java.util.List;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Client for connecting to ftx1-audio server.
@@ -83,7 +84,7 @@ public class AudioStreamClient {
     private int reconnectDelayMs = DEFAULT_RECONNECT_DELAY_MS;
     private int maxReconnectDelayMs = DEFAULT_MAX_RECONNECT_DELAY_MS;
     private volatile boolean reconnecting = false;
-    private volatile int reconnectAttempt = 0;
+    private final AtomicInteger reconnectAttempt = new AtomicInteger(0);
     private Thread reconnectThread;
 
     // Server client info (from CLIENTS_UPDATE messages)
@@ -460,7 +461,7 @@ public class AudioStreamClient {
      * Gets the current reconnection attempt number.
      */
     public int getReconnectAttempt() {
-        return reconnectAttempt;
+        return reconnectAttempt.get();
     }
 
     /**
@@ -951,17 +952,17 @@ public class AudioStreamClient {
             if (wasShortLived) {
                 // Short-lived connection - increment attempt counter
                 // This prevents endless reconnect loops when connection keeps failing immediately
-                reconnectAttempt++;
-                if (reconnectAttempt >= maxReconnectAttempts) {
+                int attempts = reconnectAttempt.incrementAndGet();
+                if (attempts >= maxReconnectAttempts) {
                     closed = true;
-                    notifyError("local", "Connection unstable - failed " + reconnectAttempt +
+                    notifyError("local", "Connection unstable - failed " + attempts +
                         " times within " + MIN_STABLE_CONNECTION_MS + "ms of connecting");
                     notifyClientDisconnected("local");
                     return;
                 }
             } else {
                 // Connection was stable - reset attempt counter for fresh start
-                reconnectAttempt = 0;
+                reconnectAttempt.set(0);
             }
             startReconnection();
         } else {
@@ -986,10 +987,10 @@ public class AudioStreamClient {
         reconnectThread = new Thread(() -> {
             int currentDelay = reconnectDelayMs;
 
-            while (!closed && reconnecting && reconnectAttempt < maxReconnectAttempts) {
-                reconnectAttempt++;
+            while (!closed && reconnecting && reconnectAttempt.get() < maxReconnectAttempts) {
+                int attempt = reconnectAttempt.incrementAndGet();
 
-                notifyReconnecting("local", reconnectAttempt, maxReconnectAttempts);
+                notifyReconnecting("local", attempt, maxReconnectAttempts);
 
                 try {
                     // Wait before attempting
@@ -1014,7 +1015,7 @@ public class AudioStreamClient {
                     Thread.currentThread().interrupt();
                     break;
                 } catch (IOException e) {
-                    notifyError("local", "Reconnect attempt " + reconnectAttempt +
+                    notifyError("local", "Reconnect attempt " + reconnectAttempt.get() +
                         "/" + maxReconnectAttempts + " failed: " + e.getMessage());
 
                     // Exponential backoff
@@ -1026,7 +1027,7 @@ public class AudioStreamClient {
             reconnecting = false;
             if (!closed) {
                 closed = true;
-                notifyError("local", "Failed to reconnect after " + reconnectAttempt + " attempts");
+                notifyError("local", "Failed to reconnect after " + reconnectAttempt.get() + " attempts");
                 notifyClientDisconnected("local");
             }
         }, "AudioClient-Reconnect");
