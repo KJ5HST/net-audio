@@ -1043,6 +1043,10 @@ public class AudioStreamClient {
         socket = new Socket();
         socket.connect(new java.net.InetSocketAddress(serverHost, serverPort), CONNECT_TIMEOUT_MS);
         protocol = new AudioProtocolHandler(socket);
+        // Shut down previous executor to prevent thread leak on repeated reconnections
+        if (executor != null) {
+            executor.shutdownNow();
+        }
         executor = Executors.newCachedThreadPool();
         connectTime = System.currentTimeMillis();
 
