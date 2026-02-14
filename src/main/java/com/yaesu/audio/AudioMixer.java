@@ -8,6 +8,7 @@ package com.yaesu.audio;
 import javax.sound.sampled.SourceDataLine;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -122,9 +123,9 @@ public class AudioMixer {
     private Thread playbackThread;
     private MixerListener listener;
 
-    // TX ownership tracking
-    private volatile String currentTxOwner = null;
-    private volatile TxPriority currentTxPriority = null;
+    // TX ownership tracking — AtomicReference ensures clientId+priority are always consistent
+    private record TxOwnership(String clientId, TxPriority priority) {}
+    private final AtomicReference<TxOwnership> txOwnership = new AtomicReference<>();
     private volatile long lastTxActivityTime = 0;
 
     // Audio buffer for mixing (single-client for now, just pass through)
@@ -168,7 +169,8 @@ public class AudioMixer {
         if (removed != null) {
             txLock.lock();
             try {
-                if (clientId.equals(currentTxOwner)) {
+                TxOwnership ownership = txOwnership.get();
+                if (ownership != null && clientId.equals(ownership.clientId())) {
                     releaseTxChannel(clientId);
                 }
             } finally {
@@ -196,21 +198,22 @@ public class AudioMixer {
         txLock.lock();
         try {
             // Check if we can claim or maintain the TX channel
-            if (currentTxOwner == null) {
+            TxOwnership ownership = txOwnership.get();
+            if (ownership == null) {
                 // Channel is free - claim it
                 claimTxChannel(clientId, client.getTxPriority());
-            } else if (currentTxOwner.equals(clientId)) {
+            } else if (ownership.clientId().equals(clientId)) {
                 // We already own it - update activity time
                 lastTxActivityTime = System.currentTimeMillis();
             } else {
                 // Someone else owns it - check if we can preempt
                 TxPriority ourPriority = client.getTxPriority();
-                if (ourPriority.canPreempt(currentTxPriority)) {
+                if (ourPriority.canPreempt(ownership.priority())) {
                     // Preempt the current owner
                     preemptCurrentOwner(clientId, ourPriority);
                 } else {
                     // Cannot preempt - notify of conflict
-                    notifyTxConflict(currentTxOwner, clientId);
+                    notifyTxConflict(ownership.clientId(), clientId);
                     return TxResult.REJECTED;
                 }
             }
@@ -237,14 +240,16 @@ public class AudioMixer {
      * @return the client ID of the current owner, or null if no one owns it
      */
     public String getCurrentTxOwner() {
-        return currentTxOwner;
+        TxOwnership ownership = txOwnership.get();
+        return ownership != null ? ownership.clientId() : null;
     }
 
     /**
      * Checks if a specific client currently owns the TX channel.
      */
     public boolean isTxOwner(String clientId) {
-        return clientId != null && clientId.equals(currentTxOwner);
+        TxOwnership ownership = txOwnership.get();
+        return clientId != null && ownership != null && clientId.equals(ownership.clientId());
     }
 
     /**
@@ -253,7 +258,8 @@ public class AudioMixer {
     public void releaseTx(String clientId) {
         txLock.lock();
         try {
-            if (clientId.equals(currentTxOwner)) {
+            TxOwnership current = txOwnership.get();
+            if (current != null && clientId.equals(current.clientId())) {
                 releaseTxChannel(clientId);
             }
         } finally {
@@ -305,8 +311,7 @@ public class AudioMixer {
         // Clear state
         txLock.lock();
         try {
-            currentTxOwner = null;
-            currentTxPriority = null;
+            txOwnership.set(null);
             txBuffer.clear();
         } finally {
             txLock.unlock();
@@ -376,7 +381,7 @@ public class AudioMixer {
     }
 
     private void checkIdleTimeout() {
-        if (currentTxOwner == null) {
+        if (txOwnership.get() == null) {
             return;
         }
 
@@ -384,9 +389,10 @@ public class AudioMixer {
         if (idleTime >= config.getTxIdleTimeoutMs()) {
             txLock.lock();
             try {
-                if (currentTxOwner != null &&
+                TxOwnership ownership = txOwnership.get();
+                if (ownership != null &&
                     System.currentTimeMillis() - lastTxActivityTime >= config.getTxIdleTimeoutMs()) {
-                    String owner = currentTxOwner;
+                    String owner = ownership.clientId();
                     releaseTxChannel(owner);
                     logger.fine("TX channel released due to idle timeout: " + owner);
                 }
@@ -397,8 +403,7 @@ public class AudioMixer {
     }
 
     private void claimTxChannel(String clientId, TxPriority priority) {
-        currentTxOwner = clientId;
-        currentTxPriority = priority;
+        txOwnership.set(new TxOwnership(clientId, priority));
         lastTxActivityTime = System.currentTimeMillis();
         txBuffer.clear();
 
@@ -414,7 +419,8 @@ public class AudioMixer {
     }
 
     private void preemptCurrentOwner(String newClientId, TxPriority newPriority) {
-        String previousOwner = currentTxOwner;
+        TxOwnership previous = txOwnership.get();
+        String previousOwner = previous != null ? previous.clientId() : null;
 
         // Notify the previous owner
         TxClient prevClient = clients.get(previousOwner);
@@ -426,8 +432,7 @@ public class AudioMixer {
 
         // Clear the buffer and claim for new owner
         txBuffer.clear();
-        currentTxOwner = newClientId;
-        currentTxPriority = newPriority;
+        txOwnership.set(new TxOwnership(newClientId, newPriority));
         lastTxActivityTime = System.currentTimeMillis();
 
         TxClient newClient = clients.get(newClientId);
@@ -442,7 +447,8 @@ public class AudioMixer {
     }
 
     private void releaseTxChannel(String clientId) {
-        if (!clientId.equals(currentTxOwner)) {
+        TxOwnership ownership = txOwnership.get();
+        if (ownership == null || !clientId.equals(ownership.clientId())) {
             return;
         }
 
@@ -453,8 +459,7 @@ public class AudioMixer {
             } catch (Exception ignored) {}
         }
 
-        currentTxOwner = null;
-        currentTxPriority = null;
+        txOwnership.set(null);
         txBuffer.clear();
 
         notifyTxOwnerChanged(null);

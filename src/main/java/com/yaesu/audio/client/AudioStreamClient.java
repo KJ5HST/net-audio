@@ -635,7 +635,7 @@ public class AudioStreamClient {
             long rxBytes = 0;
 
             try {
-                while (!closed && connected) {
+                while (!closed && connected && !Thread.currentThread().isInterrupted()) {
                     try {
                         AudioPacket packet = protocol.receivePacket(100);
                         if (packet == null) continue;
@@ -724,8 +724,12 @@ public class AudioStreamClient {
                 }
                 System.out.println("[AudioStreamClient] Starting playback loop");
 
-                while (!closed && connected) {
-                    int bytesRead = rxBuffer.read(buffer, 0, buffer.length, config.getFrameDurationMs() * 2);
+                while (!closed && connected && !Thread.currentThread().isInterrupted()) {
+                    // Guard against null buffer during reconnect (#23)
+                    AudioRingBuffer localRxBuffer = rxBuffer;
+                    if (localRxBuffer == null) break;
+
+                    int bytesRead = localRxBuffer.read(buffer, 0, buffer.length, config.getFrameDurationMs() * 2);
                     if (bytesRead > 0) {
                         if (playbackMuted) {
                             // Muted - write silence to keep audio flowing but no sound
@@ -734,34 +738,41 @@ public class AudioStreamClient {
                             playbackLine.write(buffer, 0, bytesRead);
                             bytesWritten += bytesRead;
 
-                            // Check if data is silence (all zeros)
-                            boolean allZeros = true;
-                            for (int i = 0; i < Math.min(bytesRead, 100); i++) {
-                                if (buffer[i] != 0) {
-                                    allZeros = false;
-                                    break;
+                            // Check if data is silence — sample across the full frame (#36)
+                            if (bytesWritten < 10000) {
+                                boolean allZeros = true;
+                                int step = Math.max(1, bytesRead / 64);
+                                for (int i = 0; i < bytesRead; i += step) {
+                                    if (buffer[i] != 0) {
+                                        allZeros = false;
+                                        break;
+                                    }
                                 }
-                            }
-                            if (allZeros && bytesWritten < 10000) {
-                                System.out.println("[AudioStreamClient] WARNING: Audio data appears to be silence!");
+                                if (allZeros) {
+                                    System.out.println("[AudioStreamClient] WARNING: Audio data appears to be silence!");
+                                }
                             }
                         }
 
                         // Log every 5 seconds
                         long now = System.currentTimeMillis();
                         if (now - lastLogTime > 5000) {
-                            // Sample some bytes to verify non-silence
+                            // Sample bytes across the frame to verify non-silence
                             int maxVal = 0;
-                            for (int i = 0; i < Math.min(buffer.length, 100); i++) {
+                            int step = Math.max(1, buffer.length / 64);
+                            for (int i = 0; i < Math.min(buffer.length, bytesRead); i += step) {
                                 maxVal = Math.max(maxVal, Math.abs(buffer[i]));
                             }
                             System.out.println("[AudioStreamClient] Playback: wrote " + bytesWritten + " bytes, muted: " + playbackMuted + ", maxSample: " + maxVal);
                             lastLogTime = now;
                             bytesWritten = 0;
                         }
-                    } else if (bytesRead == 0 && rxBuffer.getAvailable() == 0) {
-                        // Underrun - insert silence
-                        playbackLine.write(new byte[buffer.length], 0, buffer.length);
+                    } else if (bytesRead == 0) {
+                        AudioRingBuffer checkBuffer = rxBuffer;
+                        if (checkBuffer != null && checkBuffer.getAvailable() == 0) {
+                            // Underrun - insert silence
+                            playbackLine.write(new byte[buffer.length], 0, buffer.length);
+                        }
                     }
                 }
             } catch (Exception e) {
@@ -789,7 +800,7 @@ public class AudioStreamClient {
                 try {
                     captureLine.start();
 
-                    while (!closed && connected) {
+                    while (!closed && connected && !Thread.currentThread().isInterrupted()) {
                         int bytesRead = captureLine.read(readBuffer, 0, readBuffer.length);
                         if (bytesRead > 0 && !captureMuted) {
                             if (captureIsMono) {
@@ -828,7 +839,7 @@ public class AudioStreamClient {
             sendThread = new Thread(() -> {
                 byte[] buffer = new byte[config.getBytesPerFrame()];
                 try {
-                    while (!closed && connected) {
+                    while (!closed && connected && !Thread.currentThread().isInterrupted()) {
                         int bytesRead = txBuffer.read(buffer, 0, buffer.length, config.getFrameDurationMs() * 2);
                         if (bytesRead > 0) {
                             try {
@@ -855,7 +866,7 @@ public class AudioStreamClient {
         // Heartbeat thread
         heartbeatThread = new Thread(() -> {
             try {
-                while (!closed && connected) {
+                while (!closed && connected && !Thread.currentThread().isInterrupted()) {
                     try {
                         Thread.sleep(AudioProtocolHandler.HEARTBEAT_INTERVAL_MS);
 
