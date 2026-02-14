@@ -806,6 +806,9 @@ public class AudioStreamServer {
                     break;
                 case LATENCY_RESPONSE:
                     long sent = msg.parseLatencyTimestamp();
+                    // RTT/2 is the standard one-way latency estimate when clocks aren't synchronized.
+                    // This is intentionally simple — NTP-based correction would add complexity
+                    // for marginal accuracy gains in an audio streaming context.
                     measuredLatencyMs = (System.nanoTime() - sent) / 1_000_000 / 2;
                     break;
                 case DISCONNECT:
